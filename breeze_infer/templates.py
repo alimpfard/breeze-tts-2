@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -22,7 +23,8 @@ Request = dict[str, Any]
 @dataclass(frozen=True)
 class TemplateSpec:
     name: str
-    required_fields: tuple[str, ...]
+    # An entry may be a tuple of alternatives, satisfied if any one is present.
+    required_fields: tuple[str | tuple[str, ...], ...]
     build_segments: Callable[[Request], list[Segment]]
     build_negative_segments: Callable[[Request], list[Segment]] | None = None
     build_dual_branches: Callable[[Request], dict[str, list[Segment]]] | None = None
@@ -66,7 +68,11 @@ def _ref_audio_segment(
         "append_eos": append_eos,
         "drop_last_frame": drop_last_frame,
     }
-    if request.get("ref_audio_path"):
+    if request.get("ref_audio_codes") is not None:
+        # Already-tokenised conditioning: lets a caller round-trip the compact
+        # codec representation instead of re-encoding a waveform each request.
+        segment["audio_codes"] = request["ref_audio_codes"]
+    elif request.get("ref_audio_path"):
         segment["audio_path"] = request["ref_audio_path"]
     return segment
 
@@ -114,7 +120,12 @@ TEMPLATES: dict[str, TemplateSpec] = {
     ),
     "ref_edit_tata": TemplateSpec(
         name="ref_edit_tata",
-        required_fields=("text", "instruction", "ref_audio_path", "ref_text"),
+        required_fields=(
+            "text",
+            "instruction",
+            ("ref_audio_path", "ref_audio_codes"),
+            "ref_text",
+        ),
         build_segments=_ref_edit_tata_segments,
         build_negative_segments=_ref_edit_tata_negative_segments,
         build_dual_branches=_ref_edit_tata_dual_branches,
@@ -131,6 +142,22 @@ def get_template(name: str) -> TemplateSpec:
         ) from exc
 
 
+def _field_present(request: Request, name: str) -> bool:
+    """Truthiness test that is safe for arrays and tensors.
+
+    ``bool(ndarray)`` raises for multi-element arrays, so conditioning codes
+    cannot be checked with a plain truthiness test.
+    """
+    value = request.get(name)
+    if value is None:
+        return False
+    if torch.is_tensor(value):
+        return value.numel() > 0
+    if hasattr(value, "size") and hasattr(value, "shape"):  # numpy-like
+        return int(np.prod(value.shape)) > 0
+    return bool(value)
+
+
 def _encode_prompt_audio(audio_tokenizer: Any, audio_path: str) -> torch.Tensor:
     return encode_prompt_audio(audio_tokenizer, audio_path)
 
@@ -138,9 +165,17 @@ def _encode_prompt_audio(audio_tokenizer: Any, audio_path: str) -> torch.Tensor:
 def _resolve_segment_audio_codes(
     audio_tokenizer: Any, segment: Segment
 ) -> torch.Tensor:
+    codes = segment.get("audio_codes")
+    if codes is not None:
+        tensor = torch.as_tensor(codes, dtype=torch.int16)
+        if tensor.ndim != 2:
+            raise ValueError(
+                f"Expected 2D audio codes, got shape {tuple(tensor.shape)}"
+            )
+        return tensor.cpu().contiguous()
     audio_path = segment.get("audio_path")
     if not audio_path:
-        raise ValueError("Audio segment must include audio_path")
+        raise ValueError("Audio segment must include audio_path or audio_codes")
     return _encode_prompt_audio(audio_tokenizer, audio_path)
 
 
@@ -273,8 +308,9 @@ def prepare_inputs(
     for request in requests:
         missing = []
         for field in template.required_fields:
-            if not request.get(field):
-                missing.append(field)
+            options = field if isinstance(field, tuple) else (field,)
+            if not any(_field_present(request, option) for option in options):
+                missing.append(" or ".join(options))
         if missing:
             raise ValueError(
                 f"Request {request.get('id')} missing template fields: {missing}"

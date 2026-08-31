@@ -61,6 +61,10 @@ class FastStreamingChunk:
     sample_rate: int
     codec_frames: int
     is_final: bool
+    # The codec tokens this chunk was decoded from, shape (frames, codebooks).
+    # Exposed so callers can capture conditioning without re-encoding the audio
+    # the model just produced.
+    codes: np.ndarray | None = None
     timing: dict[str, float | int | bool] = field(default_factory=dict)
 
 
@@ -467,6 +471,7 @@ class FastBreezeStreamingRuntime:
             sample_rate=self.sample_rate,
             codec_frames=len(frames),
             is_final=is_final,
+            codes=frame_tensor.to(torch.int16).cpu().numpy(),
             timing=timing,
         )
 
@@ -894,6 +899,7 @@ class FastBreezeStreamingRuntime:
                                 sample_rate=chunk.sample_rate,
                                 codec_frames=chunk.codec_frames,
                                 is_final=chunk.is_final,
+                                codes=chunk.codes,
                                 timing=first_timing,
                             )
                         yield chunk
