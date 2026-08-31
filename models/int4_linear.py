@@ -121,6 +121,7 @@ def quantize_module_int4(
     target_names: tuple[str, ...] = DEFAULT_TARGET_NAMES,
     min_bytes: int = MIN_QUANT_BYTES,
     device: torch.device | str | None = None,
+    group_size: int = GROUP_SIZE,
 ) -> dict[str, int]:
     """Swap qualifying Linear layers under ``root`` for int4 equivalents.
 
@@ -144,7 +145,7 @@ def quantize_module_int4(
                 skipped_small += 1
                 continue
             try:
-                replacement = Int4Linear(child, device=device)
+                replacement = Int4Linear(child, group_size=group_size, device=device)
             except Exception:  # noqa: BLE001 - shape/geometry rejections
                 skipped_unsupported += 1
                 continue

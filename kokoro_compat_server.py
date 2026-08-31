@@ -46,10 +46,7 @@ from breeze_infer.runtime import (
 )
 from breeze_infer.templates import get_template, prepare_inputs
 from models.fast_streaming import FastBreezeStreamingRuntime, FastStreamingConfig
-from models.fp8_linear import quantize_module_fp8
-from models.int4_linear import quantize_module_int4
-from models.int8_linear import quantize_module_int8
-from models.offload import offload_text_embeddings
+from models.quantize_config import QuantConfig, apply_quantization
 from models.warmup_profile import load_warmup_profile
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -223,15 +220,19 @@ class BreezeEngine:
         cfg_scale: float,
         seed: int,
         fast: bool = False,
+        fast_stages: str = "all",
         fast_profile: Path | None = None,
         fp8: str = "off",
         int4: str = "off",
         int8_text: bool = False,
+        text_precision: str = "bf16",
         offload_embeddings: bool = False,
         low_memory: bool = False,
         attention_precision: str = "int4",
+        int4_group_depth: int = 128,
         device: str | None = None,
         dtype: str = "bfloat16",
+        max_seq_len: int = MAX_SEQ_LEN,
         continuity: str = "windowed",
     ) -> None:
         self.cfg_scale = cfg_scale
@@ -266,61 +267,22 @@ class BreezeEngine:
             log.info("Converted model to %s", dtype)
         update_generation_config_for_breeze(model)
 
-        # Must run before the runtime torch.compiles and CUDA-graph-captures
-        # these modules. The text encoder is deliberately excluded: it runs once
-        # per request at prefill, so quantizing it adds error for no throughput.
-        # int4 runs first so a component named by both ends up int4, and fp8 is
-        # left to cover whatever int4 did not take.
-        submodules = {
-            "depth_decoder": model.depth_decoder,
-            "backbone": model.backbone_model,
-        }
-        quantized: set[str] = set()
-
-        def _components(spec: str) -> list[str]:
-            if spec == "off":
-                return []
-            if spec == "all":
-                return ["depth_decoder", "backbone"]
-            return ["depth_decoder"] if spec == "depth" else ["backbone"]
-
-        # In low-memory mode each layer is packed onto the GPU individually, so
-        # only the packed form accumulates there. The size threshold also drops:
-        # it exists to protect throughput by leaving small L2-resident layers in
-        # bf16, but on a card that barely fits the model that trade inverts and
-        # every byte counts -- attention projections included.
-        quant_device = self.device if low_memory else None
-        quant_kwargs = {"device": quant_device}
-        if low_memory and attention_precision == "int4":
-            quant_kwargs["min_bytes"] = 256 * 1024
-            quant_kwargs["target_names"] = (
-                "gate_proj", "up_proj", "down_proj",
-                "q_proj", "k_proj", "v_proj", "o_proj",
-            )
-        for name in _components(int4):
-            stats = quantize_module_int4(submodules[name], **quant_kwargs)
-            quantized.add(name)
-            log.info("int4 %s: %s", name, stats)
-
-        for name in _components(fp8):
-            if name in quantized:
-                continue
-            stats = quantize_module_fp8(submodules[name])
-            log.info("fp8 %s: %s", name, stats)
-
-        # The text encoder runs once per request rather than per frame, so its
-        # precision costs no throughput -- and its errors feed conditioning for
-        # everything downstream, which is why it gets 8 bits rather than 4.
-        if int8_text and getattr(model, "text_encoder", None) is not None:
-            stats = quantize_module_int8(model.text_encoder)
-            log.info("int8 text_encoder: %s", stats)
-
-        # Lookup tables touched once per request; the depth decoder's embedding
-        # is deliberately left resident (16 lookups per frame). Must happen
-        # before the low-memory move below, so these are never sent to the GPU.
-        if offload_embeddings:
-            stats = offload_text_embeddings(model, self.device)
-            log.info("offload embeddings: %s", stats)
+        # Shared with the checkpoint exporter so a pre-quantized checkpoint is
+        # built exactly the way the server would build it in memory.
+        apply_quantization(
+            model,
+            QuantConfig(
+                fp8=fp8,
+                int4=int4,
+                int8_text=int8_text,
+                text_precision=text_precision,
+                offload_embeddings=offload_embeddings,
+                attention_precision=attention_precision,
+                int4_group_depth=int4_group_depth,
+                low_memory=low_memory,
+            ),
+            self.device,
+        )
 
         if low_memory:
             # Everything still in host memory (attention, codec, anything not
@@ -345,8 +307,14 @@ class BreezeEngine:
 
         config = FastStreamingConfig(
             max_new_tokens=MAX_NEW_TOKENS,
-            max_seq_len=MAX_SEQ_LEN,
-            fast_all=True if fast else None,
+            max_seq_len=max_seq_len,
+            # "decode" graphs only the per-frame stages. Prefill and the text
+            # encoder run once per request, so graphing them costs memory and
+            # capture time for little gain -- and they are what touches
+            # offloaded embeddings, which CUDA graphs cannot capture.
+            fast_all=True if (fast and fast_stages == "all") else None,
+            fast_backbone_decode=fast and fast_stages == "decode",
+            fast_depth_decoder=fast and fast_stages == "decode",
             repetition_penalty=REPETITION_PENALTY,
         )
         runtime = FastBreezeStreamingRuntime(
@@ -591,6 +559,15 @@ def main() -> None:
     parser.add_argument("--cfg-scale", type=float, default=DEFAULT_CFG_SCALE)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument(
+        "--fast-stages",
+        choices=("all", "decode"),
+        default="all",
+        help=(
+            "Which stages to CUDA-graph. 'decode' covers the per-frame path "
+            "(backbone decode, depth decoder) and skips prefill/text-encoder."
+        ),
+    )
+    parser.add_argument(
         "--fast",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -683,10 +660,12 @@ def main() -> None:
         cfg_scale=args.cfg_scale,
         seed=args.seed,
         fast=args.fast,
+        fast_stages=args.fast_stages,
         fast_profile=args.fast_profile,
         fp8=args.fp8,
         int4=args.int4,
         int8_text=args.int8_text,
+        text_precision=args.text_precision,
         offload_embeddings=args.offload_embeddings,
         low_memory=args.low_memory,
         device=args.device,
