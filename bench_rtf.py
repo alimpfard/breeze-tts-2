@@ -31,6 +31,7 @@ def main() -> None:
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--fast", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--fast-profile", type=Path, default=None)
+    parser.add_argument("--fast-stages", choices=("all", "decode"), default="all")
     parser.add_argument("--fp8", choices=("off", "depth", "backbone", "all"), default="off")
     parser.add_argument("--int4", choices=("off", "depth", "backbone", "all"), default="off")
     parser.add_argument("--device", default=None)
@@ -59,6 +60,7 @@ def main() -> None:
         cfg_scale=args.cfg_scale,
         seed=42,
         fast=args.fast,
+        fast_stages=args.fast_stages,
         fast_profile=args.fast_profile,
         fp8=args.fp8,
         int4=args.int4,

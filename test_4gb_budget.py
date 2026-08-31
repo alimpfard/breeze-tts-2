@@ -51,6 +51,7 @@ def main() -> None:
     parser.add_argument("--offload-embeddings", action="store_true")
     parser.add_argument("--low-memory", action="store_true")
     parser.add_argument("--attention-precision", choices=("int4", "bf16"), default="int4")
+    parser.add_argument("--int4-group-depth", type=int, default=128)
     parser.add_argument("--fast", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--max-seq-len", type=int, default=1024)
     args = parser.parse_args()
@@ -86,6 +87,7 @@ def main() -> None:
             offload_embeddings=args.offload_embeddings,
             low_memory=args.low_memory,
             attention_precision=args.attention_precision,
+            int4_group_depth=args.int4_group_depth,
         )
     except torch.OutOfMemoryError as exc:
         print(f"FAILED to load inside {args.budget_gb} GB: {str(exc)[:200]}")
