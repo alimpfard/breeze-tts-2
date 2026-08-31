@@ -54,6 +54,34 @@ class QuantConfig:
         }
 
 
+def place_runtime(
+    model: nn.Module, audio_tokenizer: object, device: torch.device | str
+) -> None:
+    """Move a CPU-staged runtime onto ``device``.
+
+    Exists because "put it on the GPU" is not one operation here:
+
+    - The audio tokenizer is a *sibling* object, not part of the model, loaded
+      with the same device_map -- staging on CPU leaves it behind.
+    - It is not an nn.Module either; it wraps one and records its device on the
+      wrapper, so moving the inner module alone leaves it handing CPU tensors
+      to CUDA weights.
+    - Non-persistent buffers (audio_tokens_offsets, rotary inv_freq) are absent
+      from state_dict by design, so a checkpoint load never assigns them and
+      they need the model-level .to() below.
+    - Offloaded embedding tables pin themselves to the host and are skipped,
+      provided they were wrapped before this runs.
+
+    Each of those was a separate bug before it was a line here.
+    """
+    model.to(device)
+    inner = getattr(audio_tokenizer, "model", None)
+    if isinstance(inner, nn.Module):
+        inner.to(device)
+    if hasattr(audio_tokenizer, "device"):
+        audio_tokenizer.device = device
+
+
 def _components(spec: str) -> list[str]:
     if spec == "off":
         return []

@@ -46,7 +46,11 @@ from breeze_infer.runtime import (
 )
 from breeze_infer.templates import get_template, prepare_inputs
 from models.fast_streaming import FastBreezeStreamingRuntime, FastStreamingConfig
-from models.quantize_config import QuantConfig, apply_quantization
+from models.quantize_config import (
+    QuantConfig,
+    apply_quantization,
+    place_runtime,
+)
 from models.warmup_profile import load_warmup_profile
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -285,20 +289,11 @@ class BreezeEngine:
         )
 
         if low_memory:
-            # Everything still in host memory (attention, codec, anything not
-            # quantised) goes across now. CpuOffloaded overrides _apply, so
-            # offloaded tables are skipped rather than moved and moved back --
-            # the round trip alone would spike past a small card's budget.
-            model.to(self.device)
-            # The audio tokenizer is a separate object loaded with the same
-            # device_map, so staging on CPU leaves it there while codes arrive
-            # on GPU. It is not an nn.Module itself but wraps one; it is small
-            # (~100M params) and always resident.
-            inner = getattr(audio_tokenizer, "model", None)
-            if isinstance(inner, torch.nn.Module):
-                inner.to(self.device)
-            if hasattr(audio_tokenizer, "device"):
-                audio_tokenizer.device = self.device
+            # Everything still in host memory (attention, codec, the audio
+            # tokenizer, anything not quantised) goes across now. Offloaded
+            # tables pin themselves to the host and are skipped -- the round
+            # trip alone would spike past a small card's budget.
+            place_runtime(model, audio_tokenizer, self.device)
             torch.cuda.empty_cache()
             log.info(
                 "low-memory load complete: %.2f GB allocated",
@@ -609,7 +604,17 @@ def main() -> None:
         help=(
             "Store text encoder weights as int8. Halves its ~1.4 GB at no "
             "throughput cost (it runs once per request), and unlike --fp8 works "
-            "on pre-sm_89 cards."
+            "on pre-sm_89 cards. Superseded by --text-precision int8."
+        ),
+    )
+    parser.add_argument(
+        "--text-precision",
+        choices=("bf16", "int8", "int4"),
+        default="bf16",
+        help=(
+            "Text encoder precision. It runs once per request so this costs no "
+            "throughput, but it conditions everything downstream -- int4 is only "
+            "sensible on a card that cannot otherwise fit."
         ),
     )
     parser.add_argument(

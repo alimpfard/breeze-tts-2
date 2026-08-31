@@ -17,6 +17,11 @@ from breeze_infer.runtime import (
 )
 from breeze_infer.templates import get_template, prepare_inputs
 from models.fast_streaming import FastBreezeStreamingRuntime, FastStreamingConfig
+from models.quantize_config import (
+    QuantConfig,
+    apply_quantization,
+    place_runtime,
+)
 from models.warmup_profile import load_warmup_profile
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -55,6 +60,32 @@ def main() -> None:
     parser.add_argument(
         "--fast-codec", action=argparse.BooleanOptionalAction, default=False
     )
+    parser.add_argument(
+        "--fp8", choices=("off", "depth", "backbone", "all"), default="off",
+        help="Quantize MLP weights to FP8 (needs sm_89+).",
+    )
+    parser.add_argument(
+        "--int4", choices=("off", "depth", "backbone", "all"), default="off",
+        help="Quantize MLP weights to int4, group 128 (needs sm_80+).",
+    )
+    parser.add_argument(
+        "--text-precision", choices=("bf16", "int8", "int4"), default="bf16",
+        help="Text encoder precision. It runs once per request, so lowering it "
+             "costs no throughput -- but it conditions everything downstream.",
+    )
+    parser.add_argument(
+        "--attention-precision", choices=("int4", "bf16"), default="bf16",
+        help="With --low-memory, also quantize attention projections.",
+    )
+    parser.add_argument(
+        "--offload-embeddings", action="store_true",
+        help="Keep text-side embedding tables in host memory (~1.7 GB freed).",
+    )
+    parser.add_argument(
+        "--low-memory", action="store_true",
+        help="Stage the load through host RAM and quantize layer by layer, so "
+             "peak VRAM tracks the final footprint instead of the bf16 model.",
+    )
     args = parser.parse_args()
 
     if not math.isfinite(args.cfg_scale) or args.cfg_scale <= 0:
@@ -67,12 +98,28 @@ def main() -> None:
     if args.ref_audio is not None and not args.ref_audio.is_file():
         raise FileNotFoundError(f"Reference audio not found: {args.ref_audio}")
 
+    device = resolve_device()
     tokenizer, model, audio_tokenizer = load_runtime(
         args.model,
-        device=resolve_device(),
+        device="cpu" if args.low_memory else device,
         attn_implementation="eager",
     )
     update_generation_config_for_breeze(model)
+
+    apply_quantization(
+        model,
+        QuantConfig(
+            fp8=args.fp8,
+            int4=args.int4,
+            text_precision=args.text_precision,
+            offload_embeddings=args.offload_embeddings,
+            attention_precision=args.attention_precision,
+            low_memory=args.low_memory,
+        ),
+        device,
+    )
+    if args.low_memory:
+        place_runtime(model, audio_tokenizer, device)
 
     config = FastStreamingConfig(
         max_new_tokens=MAX_NEW_TOKENS,

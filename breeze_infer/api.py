@@ -23,6 +23,11 @@ from breeze_infer.runtime import (
 )
 from breeze_infer.templates import get_template, prepare_inputs
 from models.fast_streaming import FastBreezeStreamingRuntime, FastStreamingConfig
+from models.quantize_config import (
+    QuantConfig,
+    apply_quantization,
+    place_runtime,
+)
 from models.warmup_profile import load_warmup_profile
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +48,12 @@ class ApiSettings:
     fast_backbone_decode: bool
     fast_depth_decoder: bool
     fast_codec: bool
+    fp8: str = "off"
+    int4: str = "off"
+    text_precision: str = "bf16"
+    attention_precision: str = "bf16"
+    offload_embeddings: bool = False
+    low_memory: bool = False
 
 
 _settings: ApiSettings | None = None
@@ -73,12 +84,28 @@ async def _save_upload(upload: UploadFile) -> Path:
 
 
 def _load_app(app: FastAPI, settings: ApiSettings) -> None:
+    device = resolve_device()
     tokenizer, model, audio_tokenizer = load_runtime(
         settings.model,
-        device=resolve_device(),
+        device="cpu" if settings.low_memory else device,
         attn_implementation="eager",
     )
     update_generation_config_for_breeze(model)
+
+    apply_quantization(
+        model,
+        QuantConfig(
+            fp8=settings.fp8,
+            int4=settings.int4,
+            text_precision=settings.text_precision,
+            offload_embeddings=settings.offload_embeddings,
+            attention_precision=settings.attention_precision,
+            low_memory=settings.low_memory,
+        ),
+        device,
+    )
+    if settings.low_memory:
+        place_runtime(model, audio_tokenizer, device)
 
     config = FastStreamingConfig(
         max_new_tokens=MAX_NEW_TOKENS,
@@ -234,6 +261,22 @@ def main() -> None:
     parser.add_argument(
         "--fast-codec", action=argparse.BooleanOptionalAction, default=False
     )
+    parser.add_argument(
+        "--fp8", choices=("off", "depth", "backbone", "all"), default="off",
+        help="Quantize MLP weights to FP8 (needs sm_89+).",
+    )
+    parser.add_argument(
+        "--int4", choices=("off", "depth", "backbone", "all"), default="off",
+        help="Quantize MLP weights to int4, group 128 (needs sm_80+).",
+    )
+    parser.add_argument(
+        "--text-precision", choices=("bf16", "int8", "int4"), default="bf16",
+    )
+    parser.add_argument(
+        "--attention-precision", choices=("int4", "bf16"), default="bf16",
+    )
+    parser.add_argument("--offload-embeddings", action="store_true")
+    parser.add_argument("--low-memory", action="store_true")
     args = parser.parse_args()
 
     global _settings
@@ -245,6 +288,12 @@ def main() -> None:
         fast_backbone_decode=args.fast_backbone_decode,
         fast_depth_decoder=args.fast_depth_decoder,
         fast_codec=args.fast_codec,
+        fp8=args.fp8,
+        int4=args.int4,
+        text_precision=args.text_precision,
+        attention_precision=args.attention_precision,
+        offload_embeddings=args.offload_embeddings,
+        low_memory=args.low_memory,
     )
 
     import uvicorn

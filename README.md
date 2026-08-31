@@ -41,7 +41,7 @@ Breeze TTS 2 is an open-weight text-to-speech model built for real-time interact
 
 - Linux and Python 3.10 or newer
 - A CUDA-capable NVIDIA GPU
-- GPU memory: approximately 7.7 GiB for eager inference or 14.4 GiB with `--fast-all`; use a 12 GB GPU for eager or a 24 GB GPU for the fast path
+- GPU memory: approximately 7.7 GiB for eager inference or 14.4 GiB with `--fast-all`; use a 12 GB GPU for eager or a 24 GB GPU for the fast path. See [Quantization](#-quantization) to run in under 3 GiB.
 - The Breeze TTS 2 checkpoint
 
 ### Installation
@@ -173,6 +173,92 @@ Both the CLI and API use eager streaming by default and skip graph warmup. Pass 
 | Codec | `--[no-]fast-codec` | Eager streaming decode | Single-request streaming CUDA Graph with one-frame chunks |
 
 Individual stage flags are intended for profiling and debugging.
+
+Note that most of the benefit comes from the two stages that run per audio
+frame. The depth decoder alone issues 16 calls per frame, so the decode loop is
+launch-bound without a graph, while the text encoder and backbone prefill run
+once per request. Graphing only the decode path:
+
+```bash
+python infer.py ../breeze-tts-2 --fast-backbone-decode --fast-depth-decoder ...
+```
+
+captures nearly all the speedup of `--fast-all` for substantially less memory
+and a much shorter warmup. On one measured configuration this was 6.2 GiB
+reserved instead of 10.7 GiB at the same throughput.
+
+### 🗜️ Quantization
+
+Decode is memory-bound: at batch 1-2 every weight is re-read from DRAM per
+token, and the depth decoder re-reads its weights 16 times per audio frame.
+Quantizing the weights therefore converts almost directly into throughput, and
+into a much smaller resident footprint.
+
+| Flag | Values | Effect |
+| --- | --- | --- |
+| `--fp8` | `off`, `depth`, `backbone`, `all` | FP8 (e4m3) MLP weights. Requires compute capability 8.9+. |
+| `--int4` | `off`, `depth`, `backbone`, `all` | int4 group-128 MLP weights via tinygemm. Requires 8.0+. |
+| `--text-precision` | `bf16`, `int8`, `int4` | Text encoder precision. It runs once per request, so this costs no throughput. |
+| `--attention-precision` | `bf16`, `int4` | With `--low-memory`, also quantize attention projections. |
+
+Both are weight-only: values are read from memory in the reduced precision and
+dequantized in-kernel, so the win is bandwidth rather than arithmetic. `--int4`
+takes precedence over `--fp8` for any component named by both, so
+`--int4 backbone --fp8 depth` is a valid mix.
+
+Approximate per-layer relative error, measured against bf16: FP8 ~0.037, int8
+~0.008, int4 ~0.10. The int4 figure is inherent to four bits rather than a
+defect — at group 128 the quantization step is around 0.39σ. Errors in the depth
+decoder compound across its 16 sequential codebook steps, so it is the component
+most worth keeping at higher precision if quality matters more than speed.
+
+Small projections are left alone by default. Below roughly 8 MB a layer is
+L2-resident and launch-bound, where the extra scaling work costs more than the
+bytes saved — FP8 measurably regressed on the 2.1 MB attention projections.
+
+### 💾 Running on a small GPU
+
+Two further options target GPUs that cannot hold the model at all:
+
+| Flag | Effect |
+| --- | --- |
+| `--low-memory` | Stage the load through host RAM and quantize layer by layer, so peak VRAM tracks the final footprint instead of the bf16 model. Also lowers the size threshold so attention projections are quantized. |
+| `--offload-embeddings` | Keep the text-side embedding tables in host memory, freeing ~1.7 GiB. They are gathered once per request (~2 MB moved). The depth decoder's embedding stays resident — it is read 16 times per frame. |
+
+`--low-memory` is a requirement rather than an optimisation on a small card:
+without it, quantization runs *after* a full bf16 load, so peak memory is the
+unquantized model regardless of the final size and the configuration is
+unreachable.
+
+Note that CPU offload and CUDA graphs cannot both apply to the same module — a
+host round trip is not capturable. This affects the prefill and text-encoder
+graphs only, not the per-frame decode path, so `--offload-embeddings` composes
+with `--fast-backbone-decode --fast-depth-decoder`.
+
+### 📦 Pre-quantized checkpoints
+
+Quantizing at load costs time and needs enough host RAM to hold the bf16 model.
+Export once instead:
+
+```bash
+python quantize_checkpoint.py ../breeze-tts-2 --out breeze-tts-2-int4 \
+  --int4 all --text-precision int8
+```
+
+The result is self-contained — weights, tokenizer, config and audio tokenizer —
+and loads without ever materialising a bf16 weight:
+
+```python
+from pathlib import Path
+from models.quantized_checkpoint import load_quantized_runtime
+
+tokenizer, model, audio_tokenizer, stats = load_quantized_runtime(
+    Path("breeze-tts-2-int4"), device="cuda", offload_embeddings=True,
+)
+```
+
+Loading this way takes a few seconds rather than the minute or so that loading
+and packing the full model requires.
 
 
 ## License and Responsible Use
