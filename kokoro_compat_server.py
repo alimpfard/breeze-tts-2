@@ -48,6 +48,8 @@ from breeze_infer.templates import get_template, prepare_inputs
 from models.fast_streaming import FastBreezeStreamingRuntime, FastStreamingConfig
 from models.fp8_linear import quantize_module_fp8
 from models.int4_linear import quantize_module_int4
+from models.int8_linear import quantize_module_int8
+from models.offload import offload_text_embeddings
 from models.warmup_profile import load_warmup_profile
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -224,6 +226,10 @@ class BreezeEngine:
         fast_profile: Path | None = None,
         fp8: str = "off",
         int4: str = "off",
+        int8_text: bool = False,
+        offload_embeddings: bool = False,
+        low_memory: bool = False,
+        attention_precision: str = "int4",
         device: str | None = None,
         dtype: str = "bfloat16",
         continuity: str = "windowed",
@@ -236,10 +242,20 @@ class BreezeEngine:
         self._lock = threading.Lock()
 
         self.device = resolve_device(device)
-        log.info("Loading Breeze TTS 2 from %s on %s ...", model_path, self.device)
+        # On a card that cannot hold the bf16 model at all, loading straight to
+        # GPU OOMs before quantisation ever runs -- peak is the full-precision
+        # size regardless of the final footprint. Stage through host memory and
+        # quantise layer by layer instead.
+        load_device = "cpu" if low_memory else self.device
+        log.info(
+            "Loading Breeze TTS 2 from %s on %s%s ...",
+            model_path,
+            load_device,
+            " (staging for low-memory load)" if low_memory else "",
+        )
         tokenizer, model, audio_tokenizer = load_runtime(
             model_path,
-            device=self.device,
+            device=load_device,
             attn_implementation="eager",
         )
         # load_runtime always lands in bf16. That is right on CUDA, but on CPU
@@ -268,8 +284,21 @@ class BreezeEngine:
                 return ["depth_decoder", "backbone"]
             return ["depth_decoder"] if spec == "depth" else ["backbone"]
 
+        # In low-memory mode each layer is packed onto the GPU individually, so
+        # only the packed form accumulates there. The size threshold also drops:
+        # it exists to protect throughput by leaving small L2-resident layers in
+        # bf16, but on a card that barely fits the model that trade inverts and
+        # every byte counts -- attention projections included.
+        quant_device = self.device if low_memory else None
+        quant_kwargs = {"device": quant_device}
+        if low_memory and attention_precision == "int4":
+            quant_kwargs["min_bytes"] = 256 * 1024
+            quant_kwargs["target_names"] = (
+                "gate_proj", "up_proj", "down_proj",
+                "q_proj", "k_proj", "v_proj", "o_proj",
+            )
         for name in _components(int4):
-            stats = quantize_module_int4(submodules[name])
+            stats = quantize_module_int4(submodules[name], **quant_kwargs)
             quantized.add(name)
             log.info("int4 %s: %s", name, stats)
 
@@ -278,6 +307,41 @@ class BreezeEngine:
                 continue
             stats = quantize_module_fp8(submodules[name])
             log.info("fp8 %s: %s", name, stats)
+
+        # The text encoder runs once per request rather than per frame, so its
+        # precision costs no throughput -- and its errors feed conditioning for
+        # everything downstream, which is why it gets 8 bits rather than 4.
+        if int8_text and getattr(model, "text_encoder", None) is not None:
+            stats = quantize_module_int8(model.text_encoder)
+            log.info("int8 text_encoder: %s", stats)
+
+        # Lookup tables touched once per request; the depth decoder's embedding
+        # is deliberately left resident (16 lookups per frame). Must happen
+        # before the low-memory move below, so these are never sent to the GPU.
+        if offload_embeddings:
+            stats = offload_text_embeddings(model, self.device)
+            log.info("offload embeddings: %s", stats)
+
+        if low_memory:
+            # Everything still in host memory (attention, codec, anything not
+            # quantised) goes across now. CpuOffloaded overrides _apply, so
+            # offloaded tables are skipped rather than moved and moved back --
+            # the round trip alone would spike past a small card's budget.
+            model.to(self.device)
+            # The audio tokenizer is a separate object loaded with the same
+            # device_map, so staging on CPU leaves it there while codes arrive
+            # on GPU. It is not an nn.Module itself but wraps one; it is small
+            # (~100M params) and always resident.
+            inner = getattr(audio_tokenizer, "model", None)
+            if isinstance(inner, torch.nn.Module):
+                inner.to(self.device)
+            if hasattr(audio_tokenizer, "device"):
+                audio_tokenizer.device = self.device
+            torch.cuda.empty_cache()
+            log.info(
+                "low-memory load complete: %.2f GB allocated",
+                torch.cuda.memory_allocated() / 1024**3,
+            )
 
         config = FastStreamingConfig(
             max_new_tokens=MAX_NEW_TOKENS,
@@ -563,6 +627,33 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--int8-text",
+        action="store_true",
+        help=(
+            "Store text encoder weights as int8. Halves its ~1.4 GB at no "
+            "throughput cost (it runs once per request), and unlike --fp8 works "
+            "on pre-sm_89 cards."
+        ),
+    )
+    parser.add_argument(
+        "--offload-embeddings",
+        action="store_true",
+        help=(
+            "Keep text-side embedding tables in host memory (~1.7 GB freed). "
+            "They are gathered once per request; the depth decoder's embedding "
+            "stays resident because it is hit 16x per frame."
+        ),
+    )
+    parser.add_argument(
+        "--low-memory",
+        action="store_true",
+        help=(
+            "Stage the load through host memory and quantize layer by layer, so "
+            "peak VRAM tracks the final footprint instead of the bf16 model. "
+            "Required on cards too small to hold the unquantized weights."
+        ),
+    )
+    parser.add_argument(
         "--device", default=None, help="e.g. cpu, cuda:0. Default: auto-detect."
     )
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
@@ -595,6 +686,9 @@ def main() -> None:
         fast_profile=args.fast_profile,
         fp8=args.fp8,
         int4=args.int4,
+        int8_text=args.int8_text,
+        offload_embeddings=args.offload_embeddings,
+        low_memory=args.low_memory,
         device=args.device,
         dtype=args.dtype,
         continuity=args.continuity,

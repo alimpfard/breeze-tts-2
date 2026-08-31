@@ -67,12 +67,23 @@ def quantize_int4(weight: torch.Tensor, group_size: int = GROUP_SIZE):
 class Int4Linear(nn.Module):
     """Drop-in replacement for a bias-free nn.Linear using int4 weights."""
 
-    def __init__(self, linear: nn.Linear, group_size: int = GROUP_SIZE) -> None:
+    def __init__(
+        self,
+        linear: nn.Linear,
+        group_size: int = GROUP_SIZE,
+        device: torch.device | str | None = None,
+    ) -> None:
         super().__init__()
         if linear.bias is not None:
             raise ValueError("Int4Linear expects a bias-free Linear")
 
+        # `device` supports quantising straight off a CPU-resident model: the
+        # bf16 weight visits the GPU one layer at a time and only the packed
+        # form stays, so peak memory tracks the final footprint rather than the
+        # full-precision model. Required on cards too small to hold bf16 at all.
         weight = linear.weight.data
+        if device is not None:
+            weight = weight.to(device)
         self.out_features = int(weight.shape[0])
         self.in_features = int(weight.shape[1])
         self.group_size = group_size
@@ -109,6 +120,7 @@ def quantize_module_int4(
     *,
     target_names: tuple[str, ...] = DEFAULT_TARGET_NAMES,
     min_bytes: int = MIN_QUANT_BYTES,
+    device: torch.device | str | None = None,
 ) -> dict[str, int]:
     """Swap qualifying Linear layers under ``root`` for int4 equivalents.
 
@@ -132,11 +144,14 @@ def quantize_module_int4(
                 skipped_small += 1
                 continue
             try:
-                replacement = Int4Linear(child)
+                replacement = Int4Linear(child, device=device)
             except Exception:  # noqa: BLE001 - shape/geometry rejections
                 skipped_unsupported += 1
                 continue
             setattr(module, child_name, replacement)
+            # Drop the bf16 original now rather than at the next GC cycle, so
+            # peak memory does not accumulate across layers.
+            child.weight = None
             converted += 1
             saved_bytes += nbytes - nbytes // 4
 

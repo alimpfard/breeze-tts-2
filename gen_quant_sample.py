@@ -32,6 +32,10 @@ def main() -> None:
     parser.add_argument("--voice", default="default")
     parser.add_argument("--fp8", choices=("off", "depth", "backbone", "all"), default="off")
     parser.add_argument("--int4", choices=("off", "depth", "backbone", "all"), default="off")
+    parser.add_argument("--int8-text", action="store_true")
+    parser.add_argument("--offload-embeddings", action="store_true")
+    parser.add_argument("--low-memory", action="store_true")
+    parser.add_argument("--attention-precision", choices=("int4", "bf16"), default="int4")
     parser.add_argument("--fast", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--fast-profile", type=Path, default=Path("configs/fast_service.json"))
     parser.add_argument("--cfg-scale", type=float, default=1.5)
@@ -51,6 +55,10 @@ def main() -> None:
         fast_profile=args.fast_profile,
         fp8=args.fp8,
         int4=args.int4,
+        int8_text=args.int8_text,
+        offload_embeddings=args.offload_embeddings,
+        low_memory=args.low_memory,
+        attention_precision=args.attention_precision,
     )
 
     turns: list[ConditioningTurn] = []
