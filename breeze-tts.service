@@ -1,0 +1,19 @@
+[Unit]
+Description=Breeze TTS 2 server (kokoro-compatible API)
+After=network.target
+
+[Service]
+Type=simple
+User=test
+WorkingDirectory=/home/test/breeze-tts
+Environment=PATH=/home/test/breeze-tts/.venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HF_HUB_OFFLINE=1
+ExecStart=/home/test/breeze-tts/.venv/bin/python /home/test/breeze-tts/kokoro_compat_server.py /home/test/breeze-tts-2/ --voices-dir /home/test/breeze-tts/voices --host 0.0.0.0 --port 9880 --fast --fast-profile /home/test/breeze-tts/configs/fast_service.json --fp8 depth --int4 backbone
+Restart=on-failure
+RestartSec=5
+# Imports alone take minutes on this box (root fs is over USB4), plus ~7GB of
+# weights and ~96 CUDA graph captures. Be generous.
+TimeoutStartSec=1200
+
+[Install]
+WantedBy=multi-user.target
