@@ -38,6 +38,7 @@ from breeze_infer.conditioning import (
     total_seconds,
     trim_to_budget,
 )
+from breeze_infer.normalize import normalize_text
 from breeze_infer.runtime import (
     load_runtime,
     resolve_device,
@@ -131,6 +132,16 @@ _SENTENCE_RE = re.compile(r"[^.!?\n]+(?:[.!?]+|\n+|$)")
 def strip_emoticons(text: str) -> str:
     cleaned = EMOTICON_RE.sub("", text)
     return re.sub(r"  +", " ", cleaned).strip()
+
+
+def prepare_text(text: str) -> str:
+    """Clean client text into something the model reads correctly.
+
+    Emoticons first: a TTS model will try to pronounce them (":3" comes out as
+    "three"). Then symbol/decimal normalisation, since the model drops currency
+    symbols entirely and mis-reads decimal points.
+    """
+    return normalize_text(strip_emoticons(text))
 
 
 def is_runaway(text: str, seconds: float) -> bool:
@@ -462,7 +473,7 @@ class TTSRequest(BaseModel):
 async def tts_to_audio(req: TTSRequest) -> Response:
     assert engine is not None and voices is not None
 
-    clean_text = strip_emoticons(req.text)
+    clean_text = prepare_text(req.text)
     if not clean_text:
         return Response(status_code=204)
 
