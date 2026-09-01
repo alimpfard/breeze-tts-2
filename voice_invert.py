@@ -13,6 +13,8 @@ Three commands:
     rank    labelled directory (name.wav + name.txt): confusion matrix,
             top-1 accuracy, and which codebooks carry the signal
     search  coordinate ascent over description slots for one clip
+    evolve  free-form prose: an LLM proposes descriptions, Breeze scores
+            them, the leaderboard goes back to the LLM to mutate
 
 The rank command is the honesty check. If the true instruction does not win on
 audio the model itself generated from it, the search results are noise.
@@ -22,8 +24,14 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import json
+import os
+import re
 import sys
 import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -266,6 +274,232 @@ def coordinate_ascent(
     return choice, margins
 
 
+# --- free-form search with an LLM proposer -----------------------------------
+#
+# The slot search can only say what its vocabulary can say. Here an
+# OpenAI-compatible chat endpoint writes the descriptions and Breeze grades
+# them; the graded list goes back so the proposer can infer which attributes
+# the audio rewards. Evolutionary search with the LLM as mutation operator.
+
+STYLE_EXAMPLE = (
+    "A warm, thoughtful young woman with a clear voice and a calm, reflective delivery."
+)
+
+LLM_SYSTEM = (
+    "You write voice descriptions for a text-to-speech voice designer. A "
+    "description is one to three sentences about the speaker and how they "
+    "sound: gender, age, pitch, resonance, breathiness, texture, pace, "
+    "energy, mood, accent. Describe the voice, never the words being said. "
+    f"House style: {STYLE_EXAMPLE!r}. Always reply with a JSON array of "
+    "strings and nothing else."
+)
+
+
+def llm_chat(
+    base_url: str,
+    model: str,
+    api_key: str,
+    messages: list[dict[str, str]],
+    *,
+    temperature: float = 0.9,
+    max_tokens: int = 8000,
+    reasoning_effort: str = "none",
+) -> str:
+    """Return the reply text. Reasoning models may spend the whole budget
+    thinking and return empty content; in that case the reasoning itself often
+    ends with the answer, so hand that back for parsing."""
+    body = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        # Off by default: a reasoning model spends the whole budget thinking
+        # about a leaderboard and returns empty content. Proposals are cheap
+        # to grade, so breadth beats deliberation here.
+        "reasoning_effort": reasoning_effort,
+    }
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            data = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f"HTTP {exc.code}: {exc.read()[:300]!r}") from exc
+    message = data["choices"][0]["message"]
+    content = message.get("content") or ""
+    if "[" not in content:
+        content = message.get("reasoning_content") or content
+    return content
+
+
+def parse_candidates(text: str) -> list[str]:
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    match = re.search(r"\[.*\]", text, flags=re.DOTALL)
+    if not match:
+        raise ValueError(f"no JSON array in LLM reply: {text[:200]!r}")
+    items = json.loads(match.group(0))
+    out = []
+    for item in items:
+        if isinstance(item, str) and item.strip():
+            out.append(" ".join(item.split()))
+    return out
+
+
+def _leaderboard(scored: dict[str, float], top: int = 10, bottom: int = 3) -> str:
+    ranked = sorted(scored.items(), key=lambda kv: kv[1])
+    best = ranked[0][1]
+    rows = ranked[:top]
+    if len(ranked) > top + bottom:
+        rows += [("...", None)] + ranked[-bottom:]
+    elif len(ranked) > top:
+        rows += ranked[top:]
+    lines = []
+    for desc, score in rows:
+        if score is None:
+            lines.append("  ...")
+        else:
+            lines.append(f"  {score - best:+.3f}  {desc}")
+    return "\n".join(lines)
+
+
+ROLES = (
+    (
+        "Propose {k} variants of the best entry, each changing or adding exactly "
+        "one attribute (age, pitch, resonance, breathiness, rasp or fry, pace, "
+        "energy, mood, accent)."
+    ),
+    (
+        "Propose {k} descriptions that recombine the strongest traits of the top "
+        "three entries, written fresh rather than spliced."
+    ),
+    (
+        "Propose {k} descriptions that keep what the top entries agree on but "
+        "test an attribute nobody has tried yet."
+    ),
+    (
+        "Propose {k} descriptions that keep what the top entries agree on and "
+        "state the opposite of whatever the bottom entries claim."
+    ),
+)
+
+
+def cmd_evolve(scorer: VoiceScorer, args: argparse.Namespace) -> None:
+    api_key = os.environ.get("LLM_API_KEY")
+    if not api_key:
+        sys.exit("set LLM_API_KEY for the proposer endpoint")
+    base_url = args.llm_base_url or os.environ.get("LLM_BASE_URL")
+    if not base_url:
+        sys.exit("set --llm-base-url or LLM_BASE_URL")
+
+    codes = scorer.encode(args.wav)
+    text = _read_text(args)
+    n = args.population
+    print(f"{args.wav}: {codes.shape[0]} frames, proposer={args.llm_model}\n")
+
+    def ask(prompt: str) -> list[str]:
+        for attempt in range(3):
+            try:
+                reply = llm_chat(
+                    base_url,
+                    args.llm_model,
+                    api_key,
+                    [
+                        {"role": "system", "content": LLM_SYSTEM},
+                        {"role": "user", "content": prompt},
+                    ],
+                    reasoning_effort=args.llm_reasoning,
+                )
+                return parse_candidates(reply)
+            except (ValueError, json.JSONDecodeError) as exc:
+                print(f"  (retry {attempt + 1}: {str(exc)[:160]})")
+        return []
+
+    def ask_many(prompts: list[str]) -> list[str]:
+        with ThreadPoolExecutor(max_workers=args.llm_parallel) as pool:
+            replies = list(pool.map(ask, prompts))
+        out: list[str] = []
+        for reply in replies:
+            out.extend(d for d in reply if d not in out)
+        return out
+
+    scored: dict[str, float] = {}
+
+    def grade(candidates: list[str]) -> list[tuple[str, float]]:
+        fresh = []
+        for desc in candidates:
+            if desc in scored:
+                continue
+            scored[desc] = getattr(scorer.score(desc, text, codes), args.objective)
+            fresh.append((desc, scored[desc]))
+        return fresh
+
+    t0 = time.perf_counter()
+    initial = []
+    if args.seed_slots:
+        choice, _ = coordinate_ascent(
+            scorer, text, codes, rounds=2, objective=args.objective, log=lambda *_: None
+        )
+        initial.append(compose(choice))
+    initial += ask(
+        f"The recording is of someone saying: {text!r}. You cannot hear it. "
+        f"Propose {n} maximally diverse voice descriptions spanning both "
+        "genders, several ages, low and high pitch, dark and bright timbre, "
+        "smooth and raspy texture, slow and quick delivery. JSON array only."
+    )
+    grade(initial)
+    history = []
+    for round_idx in range(args.rounds + 1):
+        ranked = sorted(scored.items(), key=lambda kv: kv[1])
+        best_desc, best = ranked[0]
+        history.append(best)
+        print(
+            f"round {round_idx}: {len(scored)} scored, best {best:.3f}  {best_desc[:100]}"
+        )
+        if round_idx == args.rounds:
+            break
+        board = (
+            "Each description below was scored by how well a TTS model's "
+            "likelihood of the recording is explained by it. Lower is better; "
+            "shown as the gap to the current best. Under 0.1 is noise, over 0.3 "
+            "is real. Attributes shared by the top entries and absent from the "
+            "bottom ones are probably true of the voice; attributes that flip "
+            "between them without changing the score do not matter.\n\n"
+            f"{_leaderboard(scored)}\n\n"
+        )
+        per = max(2, n // len(ROLES))
+        prompts = [
+            board
+            + role.format(k=per)
+            + " None may repeat a listed entry. JSON array only."
+            for role in ROLES
+        ]
+        fresh = grade(ask_many(prompts))
+        for desc, score in sorted(fresh, key=lambda kv: kv[1]):
+            marker = " *" if score < best else ""
+            print(f"    {score - best:+.3f}  {desc[:100]}{marker}")
+
+    print(
+        f"\n{time.perf_counter() - t0:.1f}s, best per round: "
+        + " ".join(f"{h:.3f}" for h in history)
+    )
+    ranked = sorted(scored.items(), key=lambda kv: kv[1])
+    print("\ntop 5:")
+    for desc, score in ranked[:5]:
+        print(f"  {score:.3f}  {desc}")
+    if args.truth:
+        truth = args.truth.read_text().strip()
+        s_truth = getattr(scorer.score(truth, text, codes), args.objective)
+        rank = sum(1 for _, v in ranked if v < s_truth) + 1
+        print(f"\ntruth {s_truth:.3f} would rank {rank}/{len(ranked) + 1}")
+        print(f"  {truth}")
+
+
 # --- commands ---------------------------------------------------------------
 
 
@@ -448,11 +682,36 @@ def main() -> None:
     )
     p.add_argument("--truth", type=Path, help="known instruction, for comparison")
 
+    p = sub.add_parser("evolve")
+    common(p)
+    p.add_argument("wav", type=Path)
+    p.add_argument("--rounds", type=int, default=6)
+    p.add_argument("--population", type=int, default=12)
+    p.add_argument(
+        "--objective", choices=("total", "backbone", "acoustic"), default="total"
+    )
+    p.add_argument("--truth", type=Path, help="known instruction, for comparison")
+    p.add_argument(
+        "--seed-slots",
+        action="store_true",
+        help="add the slot-search winner to round 0",
+    )
+    p.add_argument(
+        "--llm-base-url", help="OpenAI-compatible base URL (or LLM_BASE_URL)"
+    )
+    p.add_argument("--llm-model", default="qwen/qwen3.8-27b")
+    p.add_argument("--llm-parallel", type=int, default=4)
+    p.add_argument(
+        "--llm-reasoning", default="none", help="reasoning_effort sent to the endpoint"
+    )
+
     args = parser.parse_args()
     scorer = VoiceScorer(
         args.model, resolve_device(args.device), window_seconds=args.window
     )
-    {"score": cmd_score, "rank": cmd_rank, "search": cmd_search}[args.cmd](scorer, args)
+    {"score": cmd_score, "rank": cmd_rank, "search": cmd_search, "evolve": cmd_evolve}[
+        args.cmd
+    ](scorer, args)
 
 
 if __name__ == "__main__":
