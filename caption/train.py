@@ -114,7 +114,10 @@ def main() -> None:
                 real.append(model(lat, fm, ids, am)[0].item())
                 perm = torch.roll(torch.arange(lat.shape[0]), 1)
                 shuffled.append(model(lat[perm], fm[perm], ids, am)[0].item())
-                pooled = model._prefix(lat, fm)[:, : model.cfg.queries].float().mean(1)
+                pooled = torch.nn.functional.layer_norm(
+                    model._prefix(lat, fm)[:, : model.cfg.queries].float().mean(1),
+                    (model.lm.config.hidden_size,),
+                )
                 tg = attr_targets(chunk, vocab)
                 for k, head in model.aux_heads.items():
                     t = tg[k].to(args.device)

@@ -204,7 +204,9 @@ class Captioner(nn.Module):
         """Mean CE over attributes, on the mean prefix vector. -100 = unstated."""
         if not self.aux_heads:
             return prefix.new_zeros(())
-        pooled = prefix.float().mean(1)
+        # The prefix is scaled to the LM's embedding rms (0.03); a linear head
+        # on that starts with near-zero logits and crawls. Normalise first.
+        pooled = F.layer_norm(prefix.float().mean(1), prefix.shape[-1:])
         losses = []
         for k, head in self.aux_heads.items():
             t = targets[k]
