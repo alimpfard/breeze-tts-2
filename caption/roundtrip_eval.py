@@ -48,6 +48,8 @@ def main() -> None:
     centre = state["resampler"]["in_mean"].flatten()
 
     def sim(caption, text, original):
+        if not caption.strip():
+            caption = "Speak clearly and naturally."  # empty output scores as null
         feats = rt.render(caption, text)
         if feats is None:
             return -1.0
@@ -68,6 +70,8 @@ def main() -> None:
                 lat.to(args.device), fm.to(args.device), do_sample=False
             )
         captions[path.name] = out
+        if empties := sum(not c.strip() for c in out):
+            print(f"{path.name}: {empties} empty captions", flush=True)
         del model
         torch.cuda.empty_cache()
 
