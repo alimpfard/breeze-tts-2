@@ -77,12 +77,12 @@ def _ref_audio_segment(
     return segment
 
 
-def _ref_clone_tata_segments(request: Request) -> list[Segment]:
+def _ref_clone_tata_segments(request: Request, text_key: str = "text") -> list[Segment]:
     prefix = _speaker_prefix(request)
     return [
         {"type": "text", "text": f"{prefix}{request['ref_text']}"},
         _ref_audio_segment(request),
-        {"type": "text", "text": f"{prefix}{request['text']}"},
+        {"type": "text", "text": f"{prefix}{request[text_key]}"},
     ]
 
 
@@ -99,7 +99,12 @@ def _ref_edit_tata_segments(request: Request) -> list[Segment]:
 
 
 def _ref_edit_tata_negative_segments(request: Request) -> list[Segment]:
-    return _ref_clone_tata_segments(request)
+    # An optional `negative_text` lets the unconditional branch carry
+    # different text from the conditioned one. The kokoro server uses it to
+    # render a sentence plus a lookahead while the negative row sees the
+    # sentence alone, so that row's EOS probability marks where it ends.
+    key = "negative_text" if request.get("negative_text") else "text"
+    return _ref_clone_tata_segments(request, key)
 
 
 def _ref_edit_tata_dual_branches(request: Request) -> dict[str, list[Segment]]:

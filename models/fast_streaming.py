@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -749,7 +749,16 @@ class FastBreezeStreamingRuntime:
         inputs: dict[str, Any],
         *,
         request_id: str | None = None,
+        stop_when: Callable[[int, torch.Tensor], bool] | None = None,
     ) -> Iterator[FastStreamingChunk]:
+        """Stream audio for one request.
+
+        ``stop_when(frames_done, raw_logits)`` is consulted after every
+        backbone step in single-CFG mode with the raw per-row logits for the
+        next frame, ``[cond, uncond]``; returning True ends generation as if
+        the model had emitted EOS. It lets a caller whose negative prompt
+        carries shorter text than the positive one stop where that text ends.
+        """
         cfg = select_fast_cfg(inputs)
         branch_batch_size = 2 if cfg.mode == "single_cfg" else 1
         self._ensure_graphs(branch_batch_size, cfg.guidance_scale)
@@ -918,6 +927,12 @@ class FastBreezeStreamingRuntime:
                 )
                 logits = logits.float()
                 backbone_token_history[step_idx] = token[0]
+                if (
+                    stop_when is not None
+                    and branch.branch_batch_size == 2
+                    and stop_when(step_idx + 1, self._backbone_graph.logits_buf)
+                ):
+                    break
                 token = sample_logits(
                     logits,
                     token_history=backbone_token_history[: step_idx + 1],
