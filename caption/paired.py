@@ -47,13 +47,14 @@ def cmd_render(args) -> None:
     from caption.rl import RoundTrip
 
     si, sn = (int(x) for x in args.shard.split("/"))
-    OUT.mkdir(exist_ok=True)
+    out = args.out or OUT
+    out.mkdir(exist_ok=True)
     rt = RoundTrip(args.breeze, args.device)
     values = ATTRS[args.attr]
     for i, p in enumerate(clips(args.n, args.seed)):
         if i % sn != si:
             continue
-        if (OUT / f"{p.stem}_b.pt").exists():
+        if (out / f"{p.stem}_b.pt").exists():
             continue
         r = torch.load(p)
         a = r["attrs"]
@@ -65,8 +66,15 @@ def cmd_render(args) -> None:
             if lat is None:
                 break
             torch.save(
-                {"latents": lat.to(torch.bfloat16).cpu(), "value": v, "text": r["text"], "id": p.stem},
-                OUT / f"{p.stem}_{tag}.pt",
+                {
+                    "latents": lat.to(torch.bfloat16).cpu(),
+                    "value": v,
+                    "attrs": {args.attr: v},
+                    "prose": desc,
+                    "text": r["text"],
+                    "id": p.stem,
+                },
+                out / f"{p.stem}_{tag}.pt",
             )
         if i % 50 == 0:
             print(f"  {i}/{args.n}", flush=True)
@@ -160,6 +168,7 @@ def main() -> None:
     r.add_argument("--attr", default="mood")
     r.add_argument("--n", type=int, default=400)
     r.add_argument("--seed", type=int, default=11)
+    r.add_argument("--out", type=Path)
     r.set_defaults(fn=cmd_render)
     q = sub.add_parser("probe")
     q.add_argument("--device", default="cuda:0")

@@ -62,6 +62,12 @@ def main() -> None:
     parser.add_argument("--projector", choices=("pool", "attn", "gru"), default="pool")
     parser.add_argument("--aux-weight", type=float, default=1.0)
     parser.add_argument(
+        "--init", type=Path, help="start from a saved captioner instead of the base LM"
+    )
+    parser.add_argument(
+        "--max-per-dir", type=int, default=0, help="random subsample of each dir"
+    )
+    parser.add_argument(
         "--prose",
         type=Path,
         help="jsonl {id, attrs, prose} (caption.rewrite) replacing the records' "
@@ -71,7 +77,13 @@ def main() -> None:
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-    records = load_records(args.dirs)
+    records = []
+    for d in args.dirs:
+        recs = load_records([d])
+        if args.max_per_dir and len(recs) > args.max_per_dir:
+            recs = random.sample(recs, args.max_per_dir)
+        print(f"{d}: {len(recs)} records", flush=True)
+        records += recs
     if args.prose:
         over = {}
         for line in args.prose.read_text().splitlines():
@@ -89,13 +101,17 @@ def main() -> None:
     held, train = records[:n_hold], records[n_hold:]
     print(f"{len(train)} train, {len(held)} held out", flush=True)
 
-    vocab = build_attr_vocab(train)
-    model = Captioner(cfg=ProjectorConfig(kind=args.projector), attr_vocab=vocab).to(
-        args.device
-    )
-    model.resampler.set_input_stats(
-        [r["latents"].to(args.device) for r in train[:1000]]
-    )
+    if args.init:
+        model = Captioner.load(args.init, args.device).train()
+        vocab = model.attr_vocab
+    else:
+        vocab = build_attr_vocab(train)
+        model = Captioner(cfg=ProjectorConfig(kind=args.projector), attr_vocab=vocab).to(
+            args.device
+        )
+        model.resampler.set_input_stats(
+            [r["latents"].to(args.device) for r in train[:1000]]
+        )
     model.lm.gradient_checkpointing_enable()
     tok = model.tokenizer
     params = [
