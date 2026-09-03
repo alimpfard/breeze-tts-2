@@ -63,23 +63,27 @@ def sample_captions(model: Captioner, latents, frame_mask, k: int, max_new: int)
     return ids, mask, prefix
 
 
-def token_logprobs(model: Captioner, prefix, ids, mask):
-    """Sum of log-probs of the sampled tokens given the prefix, per row."""
+def token_logprobs(model: Captioner, prefix, ids, mask, chunk: int = 16):
+    """Sum of log-probs of the sampled tokens given the prefix, per row.
+    Chunked over rows: the full-vocab logits for 64 rows do not fit."""
     embed = model.lm.get_input_embeddings()
-    inputs = torch.cat([prefix, embed(ids)], dim=1)
-    attn = torch.cat(
-        [
-            torch.ones(prefix.shape[:2], dtype=torch.long, device=ids.device),
-            mask.long(),
-        ],
-        dim=1,
-    )
-    logits = model.lm(inputs_embeds=inputs, attention_mask=attn).logits.float()
-    # position P-1 predicts ids[:, 0]; position P+t-1 predicts ids[:, t]
     p = prefix.shape[1]
-    pred = logits[:, p - 1 : p - 1 + ids.shape[1]]
-    lp = torch.gather(F.log_softmax(pred, -1), -1, ids.unsqueeze(-1)).squeeze(-1)
-    return lp * mask, mask.sum(1)
+    lps = []
+    for i in range(0, ids.shape[0], chunk):
+        pre, tok_ids, m = prefix[i : i + chunk], ids[i : i + chunk], mask[i : i + chunk]
+        inputs = torch.cat([pre, embed(tok_ids)], dim=1)
+        attn = torch.cat(
+            [torch.ones(pre.shape[:2], dtype=torch.long, device=ids.device), m.long()],
+            dim=1,
+        )
+        logits = model.lm(inputs_embeds=inputs, attention_mask=attn).logits
+        # position P-1 predicts ids[:, 0]; position P+t-1 predicts ids[:, t]
+        pred = logits[:, p - 1 : p - 1 + tok_ids.shape[1]].float()
+        lp = -F.cross_entropy(
+            pred.reshape(-1, pred.shape[-1]), tok_ids.reshape(-1), reduction="none"
+        ).view(tok_ids.shape)
+        lps.append(lp * m)
+    return torch.cat(lps), mask.sum(1)
 
 
 class RoundTrip:
