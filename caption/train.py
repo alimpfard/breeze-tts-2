@@ -59,7 +59,7 @@ def main() -> None:
         "through the prefix",
     )
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--projector", choices=("pool", "attn"), default="pool")
+    parser.add_argument("--projector", choices=("pool", "attn", "gru"), default="pool")
     parser.add_argument("--aux-weight", type=float, default=1.0)
     parser.add_argument(
         "--prose",

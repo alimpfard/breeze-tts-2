@@ -100,7 +100,9 @@ class RoundTrip:
         )
         self.device = device
 
-    def render(self, caption: str, text: str, seed: int = 0) -> torch.Tensor | None:
+    def render(
+        self, caption: str, text: str, seed: int = 0, raw: bool = False
+    ) -> torch.Tensor | None:
         import numpy as np
 
         from breeze_infer.runtime import set_all_seeds
@@ -127,7 +129,7 @@ class RoundTrip:
             return None
         codes = torch.as_tensor(np.concatenate(parts), dtype=torch.int16)
         lat = self.extract(text, codes)
-        return pooled(lat)
+        return lat if raw else pooled(lat)
 
 
 def pooled(lat: torch.Tensor) -> torch.Tensor:

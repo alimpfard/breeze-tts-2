@@ -160,6 +160,62 @@ class PoolProjector(nn.Module):
         return out * (self.emb_rms * self.gain)
 
 
+class GruProjector(nn.Module):
+    """PoolProjector plus a temporal path: standardised frames -> BiGRU ->
+    Q learned queries attend over the states. The temporal path is added to
+    the pooled prefix through a zero-initialised output, so training starts
+    exactly at the pooled model and can only add what the frame order gives
+    (caption.paired: mood 0.44 pooled vs 0.56 GRU on exact labels)."""
+
+    def __init__(self, cfg: ProjectorConfig, lm_dim: int):
+        super().__init__()
+        self.cfg = cfg
+        self.lm_dim = lm_dim
+        self.pool = PoolProjector(cfg, lm_dim)
+        hidden = cfg.dim // 2
+        self.register_buffer("in_mean", torch.zeros(cfg.num_layers_in, 1, LATENT_DIM))
+        self.register_buffer("in_std", torch.ones(cfg.num_layers_in, 1, LATENT_DIM))
+        self.layer_logits = nn.Parameter(torch.zeros(cfg.num_layers_in))
+        self.in_norm = nn.LayerNorm(LATENT_DIM)
+        self.proj = nn.Sequential(nn.Linear(LATENT_DIM, hidden), nn.GELU())
+        self.gru = nn.GRU(
+            hidden, hidden, num_layers=2, batch_first=True,
+            bidirectional=True, dropout=cfg.dropout,
+        )
+        self.queries = nn.Parameter(torch.randn(cfg.queries, 2 * hidden) * 0.02)
+        self.cross = nn.MultiheadAttention(2 * hidden, 4, dropout=cfg.dropout, batch_first=True)
+        self.out = nn.Linear(2 * hidden, lm_dim)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    @property
+    def emb_rms(self):
+        return self.pool.emb_rms
+
+    @property
+    def gain(self):
+        return self.pool.gain
+
+    @torch.no_grad()
+    def set_input_stats(self, latents: list[torch.Tensor]) -> None:
+        self.pool.set_input_stats(latents)
+        x = torch.cat([r.float() for r in latents], dim=1)
+        self.in_mean.copy_(x.mean(1, keepdim=True))
+        self.in_std.copy_(x.std(1, keepdim=True).clamp_min(1e-3))
+
+    def forward(self, latents: torch.Tensor, frame_mask: torch.Tensor) -> torch.Tensor:
+        base = self.pool(latents, frame_mask)  # (B, Q, lm_dim), already scaled
+        w = torch.softmax(self.layer_logits, dim=0).view(1, -1, 1, 1)
+        z = (latents - self.in_mean) / self.in_std
+        x = self.proj((self.in_norm(z) * w).sum(1))
+        x, _ = self.gru(x)
+        pad = ~frame_mask
+        q = self.queries.unsqueeze(0).expand(x.shape[0], -1, -1)
+        attended, _ = self.cross(q, x, x, key_padding_mask=pad)
+        seq = self.out(attended)
+        return base + seq
+
+
 def build_attr_vocab(records: list[dict]) -> dict[str, list[str]]:
     vocab: dict[str, set[str]] = {}
     for r in records:
@@ -186,7 +242,9 @@ class Captioner(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         self.lm = AutoModelForCausalLM.from_pretrained(lm_name, dtype=torch.bfloat16)
         self.cfg = cfg or ProjectorConfig()
-        cls = PoolProjector if self.cfg.kind == "pool" else Resampler
+        cls = {"pool": PoolProjector, "attn": Resampler, "gru": GruProjector}[
+            self.cfg.kind
+        ]
         self.resampler = cls(self.cfg, self.lm.config.hidden_size)
         with torch.no_grad():
             emb = self.lm.get_input_embeddings().weight.float()
