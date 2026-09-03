@@ -45,7 +45,13 @@ from breeze_infer.runtime import (
     set_all_seeds,
     update_generation_config_for_breeze,
 )
-from breeze_infer.templates import get_template, prepare_inputs
+from breeze_infer.templates import (
+    INSTRUCTION_BOS,
+    INSTRUCTION_EOS,
+    _prepare_segment_batches,
+    get_template,
+    prepare_inputs,
+)
 from models.fast_streaming import FastBreezeStreamingRuntime, FastStreamingConfig
 from models.quantize_config import (
     QuantConfig,
@@ -107,6 +113,17 @@ RUNAWAY_SLACK_SECONDS = 2.0
 # audio length outright, so batch sentences into chunks of roughly this size.
 CHUNK_CHAR_TARGET = 300
 
+# Sentence endings are planned from the text the model can see. A sentence
+# rendered alone ends with a full stop's finality even when the next one
+# continues the thought, so a client may pass `next_text`; the first few
+# words of it are rendered along with the sentence and then cut off. The
+# cut is found by the model itself: a teacher-forced pass with the sentence
+# text alone, taking the frame at which it most wants to emit EOS.
+LOOKAHEAD_WORDS = 3
+FRAME_RATE = 12.5
+CUT_FADE_MS = 12.0
+EOS_CUT_PROB = 0.08
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("breeze-tts")
 
@@ -158,6 +175,12 @@ def instruction_for(mood: str) -> str:
     return DEFAULT_INSTRUCTION.replace("naturally", f"in a {cleaned} mood")
 
 
+def lookahead_of(next_text: str, words: int = LOOKAHEAD_WORDS) -> str:
+    """The opening words of the next sentence, enough to shape an ending."""
+    cleaned = prepare_text(next_text or "")
+    return " ".join(cleaned.split()[:words])
+
+
 def split_into_chunks(text: str, target: int = CHUNK_CHAR_TARGET) -> list[str]:
     """Group sentences into chunks of about ``target`` characters."""
     sentences = [s.strip() for s in _SENTENCE_RE.findall(text) if s.strip()]
@@ -201,7 +224,9 @@ class VoiceLibrary:
 
     def names(self) -> list[str]:
         return sorted(
-            p.stem for p in self.directory.glob("*.wav") if p.with_suffix(".txt").exists()
+            p.stem
+            for p in self.directory.glob("*.wav")
+            if p.with_suffix(".txt").exists()
         )
 
     def get(self, name: str) -> Voice | None:
@@ -218,7 +243,9 @@ class VoiceLibrary:
         longer mean anything here, so treat any miss as "use the default"
         rather than failing the request.
         """
-        candidates = [requested, self.default_name] if requested else [self.default_name]
+        candidates = (
+            [requested, self.default_name] if requested else [self.default_name]
+        )
         for name in candidates:
             voice = self.get(name)
             if voice is not None:
@@ -348,6 +375,7 @@ class BreezeEngine:
         voice: Voice,
         incoming: list[ConditioningTurn],
         instruction: str = DEFAULT_INSTRUCTION,
+        next_text: str = "",
     ) -> tuple[np.ndarray, list[ConditioningTurn]]:
         """Generate, conditioning on client-supplied state; return updated state.
 
@@ -357,24 +385,36 @@ class BreezeEngine:
         chunks = split_into_chunks(text)
         if not chunks:
             return np.zeros(0, dtype=np.float32), incoming
+        lookahead = lookahead_of(next_text)
 
         turns = list(incoming)
         pieces: list[np.ndarray] = []
         runaway = False
         with self._lock:
-            for chunk in chunks:
+            for n, chunk in enumerate(chunks):
                 ref_codes = ref_text = None
                 if self.continuity != "off" and total_seconds(turns) >= MIN_REF_SECONDS:
                     window = trim_to_budget(turns, MAX_REF_SECONDS)
                     codes, ref_text = merge(window)
                     ref_codes = codes
+                tail = lookahead if n == len(chunks) - 1 else ""
                 audio, codes = self._generate_chunk(
-                    chunk,
+                    f"{chunk} {tail}" if tail else chunk,
                     voice,
                     ref_codes=ref_codes,
                     ref_text=ref_text,
                     instruction=instruction,
                 )
+                if tail and audio.size and codes is not None and len(codes) > 2:
+                    audio, codes = self._cut_at_boundary(
+                        chunk,
+                        audio,
+                        codes,
+                        ref_codes=ref_codes,
+                        ref_text=ref_text,
+                        voice=voice,
+                        instruction=instruction,
+                    )
                 if audio.size:
                     pieces.append(audio)
                     if is_runaway(chunk, len(audio) / self.sample_rate):
@@ -397,6 +437,111 @@ class BreezeEngine:
             return np.zeros(0, dtype=np.float32), turns
         merged = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
         return merged, turns
+
+    @torch.no_grad()
+    def _cut_at_boundary(
+        self,
+        text: str,
+        audio: np.ndarray,
+        codes: np.ndarray,
+        *,
+        ref_codes: np.ndarray | None,
+        ref_text: str | None,
+        voice: Voice,
+        instruction: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Trim audio rendered as ``text + lookahead`` back to just ``text``.
+
+        Teacher-force the generated codes under a prompt containing ``text``
+        only and read the backbone's EOS probability after every frame: it
+        peaks where the sentence is finished. The search window excludes the
+        first half of the expected duration so an early pause cannot win.
+        """
+        if ref_codes is not None and ref_text:
+            ref_segment = {
+                "type": "audio",
+                "audio_codes": ref_codes,
+                "append_eos": True,
+            }
+            ref_text_segment = f"[S0]{ref_text}"
+        else:
+            ref_segment = {
+                "type": "audio",
+                "audio_path": str(voice.wav),
+                "append_eos": True,
+            }
+            ref_text_segment = f"[S0]{voice.transcript}"
+        segments = [
+            {"type": "text", "text": ref_text_segment},
+            ref_segment,
+            {
+                "type": "text",
+                "text": f"[S0]{INSTRUCTION_BOS}{instruction}{INSTRUCTION_EOS}{text}",
+            },
+            {"type": "audio", "audio_codes": codes, "append_eos": False},
+        ]
+        inputs = _prepare_segment_batches(
+            self.tokenizer,
+            self.audio_tokenizer,
+            self.model.config,
+            self.device,
+            [segments],
+        )
+        # Through the backbone directly: the fast runtime keeps lm_head in
+        # fp32 and applies it to upcast hidden states, so the model's own
+        # forward (bf16 into lm_head) does not fit that configuration.
+        merged = self.model._merge_input_ids_with_input_values(
+            inputs["input_ids"],
+            inputs["input_values"].long(),
+            None,
+            text_ids_mask=inputs["text_ids_mask"],
+            text_ids_len=inputs["text_ids_len"],
+            attention_mask=inputs["attention_mask"],
+        )
+        hidden = self.model.backbone_model(
+            inputs_embeds=merged["inputs_embeds"],
+            attention_mask=inputs["attention_mask"],
+            use_cache=False,
+            text_encoder_layer_hidden_states=merged["text_encoder_layer_hidden_states"],
+            text_ids_mask=inputs["text_ids_mask"],
+        ).last_hidden_state
+        audio_mask = inputs["input_ids"][0] == self.model.config.audio_token_id
+        # Positions of the *generated* frames are the last len(codes) audio
+        # positions; the reference clip's frames come first.
+        positions = audio_mask.nonzero().flatten()[-len(codes) :]
+        head = self.model.lm_head
+        logits = head(hidden[0, positions].to(head.weight.dtype)).float()
+        p_eos = torch.log_softmax(logits, dim=-1)[:, self.model.backbone_eos_token_id]
+        expected = len(text) / CHARS_PER_SECOND * FRAME_RATE
+        lo = int(max(1, min(len(codes) - 2, expected * 0.5)))
+        # The first frame past the minimum where EOS becomes likely, not the
+        # most likely frame: after the lookahead words have been spoken EOS
+        # is certain (p=1.0) while the real boundary is a bump of 0.1-0.4, so
+        # an argmax drifts to the end and leaks the next sentence's words.
+        probs = p_eos[lo:-1].exp()
+        above = (probs >= EOS_CUT_PROB).nonzero().flatten()
+        first = int(above[0].item()) if len(above) else int(probs.argmax().item())
+        cut = lo + first + 1  # frames to keep
+        spf = round(self.sample_rate / FRAME_RATE)
+        kept = audio[: cut * spf].copy()
+        fade = min(len(kept), int(self.sample_rate * CUT_FADE_MS / 1000))
+        if fade > 0:
+            kept[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+        top = torch.topk(p_eos, k=min(6, len(p_eos)))
+        log.info(
+            "eos curve: top frames %s  probs %s",
+            top.indices.tolist(),
+            [round(float(v), 3) for v in top.values.exp().tolist()],
+        )
+        log.info(
+            "lookahead cut at %d/%d frames (%.1fs of %.1fs, expected ~%.1fs)",
+            cut,
+            len(codes),
+            cut / FRAME_RATE,
+            len(codes) / FRAME_RATE,
+            expected / FRAME_RATE,
+        )
+        return kept, codes[:cut]
 
     def _generate_chunk(
         self,
@@ -467,6 +612,10 @@ class TTSRequest(BaseModel):
     conditioning: str = ""
     # Free-text mood, e.g. "wry" -> "Speak clearly and in a wry mood."
     mood: str = ""
+    # The sentence that will follow this one. Its opening words are rendered
+    # along with the text and cut off, so the ending is shaped by what comes
+    # next instead of always closing like the end of a paragraph.
+    next_text: str = ""
 
 
 @app.post("/tts_to_audio")
@@ -495,7 +644,7 @@ async def tts_to_audio(req: TTSRequest) -> Response:
 
     started = time.time()
     audio, outgoing = engine.synthesize_stateless(
-        clean_text, voice, incoming, instruction
+        clean_text, voice, incoming, instruction, next_text=req.next_text
     )
     if not audio.size:
         return Response(status_code=400, content="No audio generated")
@@ -520,9 +669,7 @@ async def tts_to_audio(req: TTSRequest) -> Response:
     headers = {"X-Sample-Rate": str(engine.sample_rate)}
     if outgoing:
         headers["X-Conditioning"] = encode_state(outgoing)
-    return Response(
-        content=buf.getvalue(), media_type="audio/wav", headers=headers
-    )
+    return Response(content=buf.getvalue(), media_type="audio/wav", headers=headers)
 
 
 @app.get("/health")
