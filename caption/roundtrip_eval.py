@@ -20,7 +20,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from caption.model import Captioner, collate
-from caption.rl import RoundTrip
+from caption.rl import RoundTrip, pooled
+import torch.nn.functional as F
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -41,6 +42,19 @@ def main() -> None:
         torch.load(p) for p in files[-args.n :]
     ]  # tail: never in any RL train slice
     rt = RoundTrip(args.breeze, args.breeze_device)
+    # Centre on the projector's input mean so the shared component doesn't
+    # compress every cosine into 0.83-0.91 (same as the RL reward).
+    state = torch.load(args.captioners[0] / "resampler.pt", map_location="cpu")
+    centre = state["resampler"]["in_mean"].flatten()
+
+    def sim(caption, text, original):
+        feats = rt.render(caption, text)
+        if feats is None:
+            return -1.0
+        a, b = feats.flatten(), pooled(original).flatten()
+        if centre is not None:
+            a, b = a - centre, b - centre
+        return F.cosine_similarity(a, b, dim=0).item()
 
     captions = {"truth": [r["prose"] for r in recs]}
     captions["null"] = ["Speak clearly and naturally."] * len(recs)
@@ -62,7 +76,7 @@ def main() -> None:
     )
     sims = {}
     for name, caps in captions.items():
-        vals = [rt(c, r["text"], r["latents"]) for c, r in zip(caps, recs)]
+        vals = [sim(c, r["text"], r["latents"]) for c, r in zip(caps, recs)]
         sims[name] = vals
         mean = sum(vals) / len(vals)
         print(f"{name:<18} mean {mean:.4f}", flush=True)

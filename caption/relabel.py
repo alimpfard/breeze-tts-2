@@ -24,6 +24,7 @@ from voice_invert import VoiceScorer
 
 REPO = Path(__file__).resolve().parents[1]
 RELABEL = ("mood", "texture", "brightness", "pitch", "energy")
+WINDOW_FRAMES = 25  # first 2 s: where the description matters most
 
 
 def main() -> None:
@@ -55,19 +56,34 @@ def main() -> None:
             a = r["attrs"]
             attrs = dict(a)
             margin = {}
+            raw = {}
             for attr in RELABEL:
                 scores = {}
                 for v in ATTRS[attr]:
                     desc = TEMPLATES[attr].format(
                         gender=a["gender"], age=a["age"], value=v
                     )
-                    scores[v] = scorer.score(desc, r["text"], r["codes"]).total
+                    sc = scorer.score(desc, r["text"], r["codes"])
+                    scores[v] = sc.total
+                    # Raw numbers too, so labels can be calibrated offline:
+                    # the argmin favours whichever template wording is
+                    # cheapest regardless of the audio (54% "bright" etc.).
+                    raw.setdefault(attr, {})[v] = [
+                        round(sc.total, 4),
+                        round(float(sc.per_frame[:WINDOW_FRAMES].mean()), 5),
+                    ]
                 order = sorted(scores, key=scores.get)
                 attrs[attr] = order[0]
                 margin[attr] = round(scores[order[1]] - scores[order[0]], 4)
             fh.write(
                 json.dumps(
-                    {"id": p.stem, "attrs": attrs, "requested": a, "margin": margin}
+                    {
+                        "id": p.stem,
+                        "attrs": attrs,
+                        "requested": a,
+                        "margin": margin,
+                        "scores": raw,
+                    }
                 )
                 + "\n"
             )
