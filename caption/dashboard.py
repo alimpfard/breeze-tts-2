@@ -149,12 +149,61 @@ def train_status() -> dict | None:
     }
 
 
+_RL_STEP = re.compile(
+    r"step (\d+)/(\d+) reward (-?[\d.]+) \(best-in-group (-?[\d.]+)\) kl ([\d.]+) len (\d+) ([\d.]+)min"
+)
+_RL_HELD = re.compile(
+    r"held-out reward(?: before| after)?: policy (-?[\d.]+)(?:\s+reference (-?[\d.]+))?"
+)
+
+
+def rl_status() -> list[dict]:
+    out = []
+    for log in sorted(DATA.glob("rl*.log")):
+        text = log.read_text()
+        steps = _RL_STEP.findall(text)
+        held = _RL_HELD.findall(text)
+        samples = re.findall(r"^    (.+)$", text, flags=re.MULTILINE)
+        name = log.stem.replace("rl_", "").replace("rl", "likelihood") or "rl"
+        if name == "rt":
+            name = "roundtrip"
+        elif name == "hi":
+            name = "likelihood, high lr"
+        entry = {
+            "name": name,
+            "log": log.name,
+            "state": (
+                "done"
+                if "saved to" in text
+                else "failed"
+                if "Traceback" in text
+                else "running"
+                if time.time() - log.stat().st_mtime < 600
+                else "stopped"
+            ),
+            "step": int(steps[-1][0]) if steps else 0,
+            "total": int(steps[-1][1]) if steps else 0,
+            "rewards": [float(x[2]) for x in steps][-80:],
+            "best": [float(x[3]) for x in steps][-80:],
+            "kl": float(steps[-1][4]) if steps else 0.0,
+            "len": int(steps[-1][5]) if steps else 0,
+            "minutes": float(steps[-1][6]) if steps else 0.0,
+            "held": [(float(a), float(b) if b else None) for a, b in held],
+            "sample": samples[-1] if samples else "",
+            "mtime": log.stat().st_mtime,
+        }
+        out.append(entry)
+    out.sort(key=lambda e: -e["mtime"])
+    return out
+
+
 def status() -> dict:
     return {
         "time": time.time(),
         "jobs": [job_status(*j) for j in JOBS],
         "gpus": gpu_status(),
         "train": train_status(),
+        "rl": rl_status(),
         "descriptions": sum(1 for _ in (DATA / "descriptions.jsonl").open())
         if (DATA / "descriptions.jsonl").exists()
         else 0,
@@ -222,6 +271,7 @@ h1 small{color:var(--dim);font-size:14px;margin-left:10px}
     <div style="margin-top:12px;color:var(--dim);font-size:13px">every clip is a voice that never existed, described in prose that an llm made up, so a small model can learn to describe voices that do.</div></div>
   <div class="card" id="traincard"><h2>captioner training</h2><div id="train" style="color:var(--dim)">not started</div></div>
 </div>
+<div class="grid" id="rl" style="margin-top:14px"></div>
 <div class="grid" style="margin-top:14px">
   <div class="card wide"><h2>fresh off the gpu</h2><div id="recent"></div></div>
 </div>
@@ -266,6 +316,17 @@ function render(d){
       <div style="color:var(--dim);font-size:12px;margin-top:8px">which backbone layers it listens to</div>
       <div class="layers">${t.layers.map((v,i)=>`<div style="height:${Math.max(4,v*100)}%" data-l="L${[7,14,21,28][i]}"></div>`).join("")}</div>
       ${t.samples.length?`<div style="margin-top:22px;font-size:12.5px">${t.samples.map(([a,b])=>`<div style="margin:6px 0"><span style="color:var(--dim)">truth</span> ${a}<br><span style="color:var(--d)">model</span> ${b}</div>`).join("")}</div>`:""}`}
+  $("#rl").innerHTML=(d.rl||[]).map(r=>{const f=r.total?r.step/r.total:0;const pts=r.rewards;const w=300,h=50;const mx=Math.max(...pts,...r.best),mn=Math.min(...pts,...r.best);
+    const path=a=>a.map((v,i)=>`${i?"L":"M"}${(i/(a.length-1||1)*w).toFixed(1)},${(h-(v-mn)/(mx-mn+1e-9)*h).toFixed(1)}`).join(" ");
+    const held=r.held.map(([p,q],i)=>`<span>${i==0?"before":"@"+(i*100)} <b>${p.toFixed(3)}</b>${q!=null?" vs "+q.toFixed(3):""}</span>`).join("");
+    const last=r.held.length?r.held[r.held.length-1]:null;const delta=last&&last[1]!=null?(last[0]-last[1]):(r.held.length>1?r.held[r.held.length-1][0]-r.held[0][0]:null);
+    return `<div class="card wide"><h2><span class="dot ${r.state=="running"?"on":""}"></span>rl · ${r.name} reward</h2>
+      <div class="big">${delta==null?"—":(delta>=0?"+":"")+delta.toFixed(3)}<span>held-out policy − reference · step ${r.step}/${r.total} · ${r.state}</span></div>
+      <div class="bar"><i class="${r.state=="running"?"on":""}" style="width:${(f*100).toFixed(1)}%;background:linear-gradient(90deg,var(--d),var(--b))"></i></div>
+      <svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><path d="${path(r.best)}" fill="none" stroke="var(--dim)" stroke-width="1"/><path d="${path(pts)}" fill="none" stroke="var(--d)" stroke-width="1.5"/></svg>
+      <div class="meta"><span>batch reward <b>${pts.length?pts[pts.length-1].toFixed(3):"—"}</b> (grey: best-in-group)</span><span>kl <b>${r.kl.toFixed(3)}</b></span><span>len <b>${r.len}</b></span><span>${r.minutes.toFixed(0)} min</span></div>
+      <div class="meta" style="margin-top:6px">${held}</div>
+      ${r.sample?`<div style="margin-top:10px;font-size:13px"><span style="color:var(--dim)">sampled</span> ${r.sample}</div>`:""}</div>`}).join("");
   $("#foot").textContent="read-only. refreshes every 2s. the particles take their colours from the newest clip's latent fingerprint, which is meaningless but nice.";
 }
 async function poll(){try{const r=await fetch("/api/status");render(await r.json())}catch(e){$("#sub").textContent="lost the server: "+e}finally{setTimeout(poll,2000)}}
