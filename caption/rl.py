@@ -228,6 +228,7 @@ def main() -> None:
         help="comma-separated devices, one Breeze runtime each, renders split across them",
     )
     parser.add_argument("--eval-clips", type=int, default=32)
+    parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument(
         "--reward-centred",
         action=argparse.BooleanOptionalAction,
@@ -321,6 +322,7 @@ def main() -> None:
     steps = int(len(train) / args.batch * args.epochs)
     print(f"held-out reward before: policy {held_out_eval()[0]:.3f}", flush=True)
     started = time.time()
+    best_held = float("-inf")
     for step in range(steps):
         chunk = random.sample(train, args.batch)
         lat, fm, _, _ = collate(chunk, tok)
@@ -365,11 +367,15 @@ def main() -> None:
                 flush=True,
             )
             print(f"    {caps[0][:150]}", flush=True)
-        if step and step % 100 == 0:
+        if step and step % args.eval_every == 0:
             pol, base = held_out_eval()
             print(
                 f"  held-out reward: policy {pol:.3f}  reference {base:.3f}", flush=True
             )
+            if pol > best_held:
+                best_held = pol
+                policy.save(args.out / "best")
+                print(f"  saved best ({pol:.3f}) to {args.out / 'best'}", flush=True)
 
     pol, base = held_out_eval()
     print(f"held-out reward after: policy {pol:.3f}  reference {base:.3f}")
