@@ -125,9 +125,10 @@ _GAP = re.compile(r"\(gap ([+-][\d.]+)\)")
 
 
 def train_status() -> dict | None:
-    log = DATA / "train.log"
-    if not log.exists():
+    logs = sorted(DATA.glob("train*.log"), key=lambda p: p.stat().st_mtime)
+    if not logs:
         return None
+    log = logs[-1]
     text = log.read_text()
     steps = _STEP.findall(text)
     held = _HELD.findall(text)
