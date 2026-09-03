@@ -10,6 +10,18 @@ Speaks the same HTTP contract the old kokoro-tts service did
 A "voice" is a reference clip in VOICES_DIR: ``<name>.wav`` plus a
 ``<name>.txt`` holding its exact transcript, which Breeze needs for
 reference-based cloning.
+
+Voice design, on top of that contract:
+
+    POST /tts_to_audio   {..., instruction: "A calm elderly man ..."}
+    POST /describe_voice multipart {audio, text} -> {description, alternatives}
+
+A request carrying ``instruction`` gets a voice made from that description
+(Breeze's voice-design mode) instead of a reference clip; continuity works
+the same way. ``/describe_voice`` runs the captioner (caption/, see
+--captioner) on a recording plus its transcript and returns a description
+in the same language the designer takes, so a voice can be recorded,
+described, edited and then spoken.
 """
 
 from __future__ import annotations
@@ -27,9 +39,11 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 import torch
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, File, Form, Response, UploadFile
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from breeze_infer.audio import encode_prompt_audio
 from breeze_infer.conditioning import (
     ConditioningTurn,
     decode_state,
@@ -74,6 +88,24 @@ DEFAULT_INSTRUCTION = "Speak clearly and naturally."
 # token buckets, so an unbounded value would spawn a new CUDA graph per variant.
 MAX_MOOD_CHARS = 40
 _MOOD_ALLOWED_RE = re.compile(r"[^a-zA-Z0-9 ,'-]+")
+
+# A voice description (voice design). Square brackets are the model's own
+# instruction syntax, so they are stripped; length is capped for the same
+# CUDA-graph reason as the mood. The first chunk of a designed voice has no
+# reference audio, so it gets the guidance strength the designer was tuned
+# at; once the conditioning chain carries the voice, the server's own scale
+# applies as for clones.
+MAX_INSTRUCTION_CHARS = 400
+_INSTRUCTION_STRIP_RE = re.compile(r"[\[\]{}<>|]+")
+DESIGN_CFG_SCALE = 4.0
+# What a client should ask the user to read for /describe_voice: long enough
+# for the captioner (it reads the first seconds hardest), neutral in content.
+DESIGN_SAMPLE_TEXT = (
+    "The library was quiet at that hour, and the light through the tall "
+    "windows fell across the reading tables in long, pale stripes. She "
+    "found the book exactly where she had left it, and sat down to finish "
+    "the chapter before anyone else arrived."
+)
 
 # Cross-request voice continuity. Each reply conditions on recent speech rather
 # than always on the canonical clip, so consecutive replies do not jump. Whole
@@ -177,6 +209,13 @@ def instruction_for(mood: str) -> str:
     if not cleaned:
         return DEFAULT_INSTRUCTION
     return DEFAULT_INSTRUCTION.replace("naturally", f"in a {cleaned} mood")
+
+
+def design_instruction(text: str) -> str:
+    """Sanitise a client-supplied voice description; "" when there is none."""
+    cleaned = _INSTRUCTION_STRIP_RE.sub(" ", text or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()[:MAX_INSTRUCTION_CHARS].strip()
+    return cleaned
 
 
 def trim_trailing_silence(audio: np.ndarray, sample_rate: int) -> np.ndarray:
@@ -394,7 +433,7 @@ class BreezeEngine:
     def synthesize_stateless(
         self,
         text: str,
-        voice: Voice,
+        voice: Voice | None,
         incoming: list[ConditioningTurn],
         instruction: str = DEFAULT_INSTRUCTION,
         next_text: str = "",
@@ -403,6 +442,10 @@ class BreezeEngine:
 
         The server keeps nothing: whatever conditioning arrives is what is used,
         and the caller gets back the state to echo on the next request.
+
+        ``voice`` is None for a designed voice: the instruction is the voice
+        description, and chunks with no conditioning to continue from are
+        generated in voice-design mode.
         """
         chunks = split_into_chunks(text)
         if not chunks:
@@ -456,7 +499,7 @@ class BreezeEngine:
     def _generate_chunk(
         self,
         text: str,
-        voice: Voice,
+        voice: Voice | None,
         *,
         ref_codes: np.ndarray | None = None,
         ref_text: str | None = None,
@@ -492,12 +535,19 @@ class BreezeEngine:
                     p_cond, 1e-6
                 )
 
+        template, cfg_scale = "ref_edit_tata", self.cfg_scale
         if ref_codes is not None and ref_text:
             request["ref_audio_codes"] = ref_codes
             request["ref_text"] = ref_text
-        else:
+        elif voice is not None:
             request["ref_audio_path"] = str(voice.wav)
             request["ref_text"] = voice.transcript
+        else:
+            # Designed voice with nothing to continue from: the description
+            # alone defines the voice.
+            template, cfg_scale = "tts_instruction", DESIGN_CFG_SCALE
+        if stop_when is not None and cfg_scale == 1.0:
+            stop_when = None
 
         set_all_seeds(self.seed)
         inputs = prepare_inputs(
@@ -505,8 +555,8 @@ class BreezeEngine:
             self.audio_tokenizer,
             self.model,
             [request],
-            get_template("ref_edit_tata"),
-            guidance_scale=self.cfg_scale,
+            get_template(template),
+            guidance_scale=cfg_scale,
             guidance_scale_ref=None,
             guidance_scale_ins=None,
         )
@@ -543,6 +593,7 @@ class BreezeEngine:
 
 engine: BreezeEngine | None = None
 voices: VoiceLibrary | None = None
+describer: VoiceDescriber | None = None
 
 app = FastAPI(title="Breeze TTS (kokoro-compatible)")
 
@@ -560,6 +611,9 @@ class TTSRequest(BaseModel):
     # this one ends (see LOOKAHEAD_WORDS); only this sentence's audio comes
     # back.
     next_text: str = ""
+    # A voice description, e.g. from /describe_voice. When set, the voice is
+    # designed from it and speaker_wav is ignored.
+    instruction: str = ""
 
 
 @app.post("/tts_to_audio")
@@ -570,10 +624,13 @@ async def tts_to_audio(req: TTSRequest) -> Response:
     if not clean_text:
         return Response(status_code=204)
 
-    requested = req.speaker_wav if req.speaker_wav not in ("default", "") else ""
-    voice = voices.resolve(requested)
-    if voice is None:
-        return Response(status_code=400, content="No usable voice configured")
+    design = design_instruction(req.instruction)
+    voice: Voice | None = None
+    if not design:
+        requested = req.speaker_wav if req.speaker_wav not in ("default", "") else ""
+        voice = voices.resolve(requested)
+        if voice is None:
+            return Response(status_code=400, content="No usable voice configured")
 
     incoming: list[ConditioningTurn] = []
     if req.conditioning:
@@ -584,7 +641,13 @@ async def tts_to_audio(req: TTSRequest) -> Response:
             # canonical voice and let the client resynchronise.
             log.warning("ignoring conditioning: %s", exc)
 
+    # A designed voice carries its description as the instruction throughout,
+    # mood included: "..., speaking in a calm mood" reads naturally to the
+    # text encoder and keeps the mood control working for designed voices.
     instruction = instruction_for(req.mood)
+    if design:
+        mood = instruction[len(DEFAULT_INSTRUCTION.split("naturally")[0]) :].rstrip(".")
+        instruction = design if instruction == DEFAULT_INSTRUCTION else f"{design} Speak {mood}."
 
     started = time.time()
     audio, outgoing = engine.synthesize_stateless(
@@ -604,7 +667,7 @@ async def tts_to_audio(req: TTSRequest) -> Response:
         duration,
         elapsed,
         duration / elapsed if elapsed > 0 else 0.0,
-        voice.name,
+        voice.name if voice is not None else f"design:{design[:40]!r}",
         req.mood or "",
         total_seconds(incoming),
         total_seconds(outgoing),
@@ -616,12 +679,103 @@ async def tts_to_audio(req: TTSRequest) -> Response:
     return Response(content=buf.getvalue(), media_type="audio/wav", headers=headers)
 
 
+class VoiceDescriber:
+    """caption/ captioner over the engine's own backbone: audio + transcript
+    -> a design prompt. Shares the engine lock; the backbone is not reentrant."""
+
+    def __init__(self, engine: BreezeEngine, path: Path) -> None:
+        from caption.gen import LatentExtractor
+        from caption.model import Captioner
+
+        log.info("Loading captioner from %s ...", path)
+        self.engine = engine
+        self.captioner = Captioner.load(path, engine.device)
+        self.extract = LatentExtractor(
+            engine.tokenizer, engine.model, engine.audio_tokenizer, engine.device
+        )
+        log.info("Captioner ready.")
+
+    def describe(self, wav: Path, text: str, alternatives: int = 2) -> list[str]:
+        codes = encode_prompt_audio(self.engine.audio_tokenizer, wav)
+        with self.engine._lock:
+            latents = self.extract(text, codes)
+            lat = latents.float().unsqueeze(0).to(self.engine.device)
+            mask = torch.ones(1, lat.shape[2], dtype=torch.bool, device=lat.device)
+            out = self.captioner.generate(lat, mask, do_sample=False)
+            for _ in range(alternatives):
+                out += self.captioner.generate(
+                    lat, mask, do_sample=True, temperature=0.8, top_p=0.95
+                )
+        return [o.strip() for o in out if o.strip()]
+
+
+def decode_upload(data: bytes, suffix: str) -> Path:
+    """Any container the browser or phone records in -> 24 kHz mono wav."""
+    import subprocess
+    import tempfile
+
+    src = tempfile.NamedTemporaryFile(suffix=suffix or ".bin", delete=False)
+    src.write(data)
+    src.close()
+    dst = Path(src.name).with_suffix(".decoded.wav")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", src.name,
+             "-ac", "1", "-ar", "24000", "-f", "wav", str(dst)],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+    finally:
+        Path(src.name).unlink(missing_ok=True)
+    return dst
+
+
+@app.post("/describe_voice")
+async def describe_voice(audio: UploadFile = File(...), text: str = Form("")) -> Response:
+    """Recording + its transcript -> voice description(s) for `instruction`."""
+    if describer is None:
+        return Response(status_code=501, content="No captioner loaded (--captioner)")
+    transcript = prepare_text(text)
+    if not transcript:
+        return Response(status_code=400, content="text (the transcript) is required")
+    data = await audio.read()
+    if not data:
+        return Response(status_code=400, content="empty audio")
+    suffix = Path(audio.filename or "").suffix
+    started = time.time()
+    try:
+        wav = decode_upload(data, suffix)
+    except Exception as exc:  # ffmpeg failure, unreadable container
+        log.warning("describe_voice: cannot decode upload: %s", exc)
+        return Response(status_code=400, content="could not decode the audio")
+    try:
+        seconds = sf.info(wav).duration
+        descriptions = describer.describe(wav, transcript)
+    finally:
+        wav.unlink(missing_ok=True)
+    log.info(
+        "Described %.1fs of audio in %.2fs: %r", seconds, time.time() - started,
+        descriptions[0] if descriptions else "",
+    )
+    return JSONResponse(
+        {
+            "description": descriptions[0] if descriptions else "",
+            "alternatives": descriptions[1:],
+            "seconds": round(seconds, 2),
+        }
+    )
+
+
 @app.get("/health")
 async def health() -> dict:
     if engine is None or voices is None:
         return {"status": "loading"}
     return {
         "status": "ok",
+        "voice_design": True,
+        "describe_voice": describer is not None,
+        "design_sample_text": DESIGN_SAMPLE_TEXT,
         "backend": "breeze-tts-2",
         "device": engine.device,
         "sample_rate": engine.sample_rate,
@@ -742,6 +896,12 @@ def main() -> None:
     )
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
     parser.add_argument(
+        "--captioner",
+        type=Path,
+        default=REPO_ROOT / "data/caption/captioner",
+        help="caption/ checkpoint for /describe_voice; skipped if missing",
+    )
+    parser.add_argument(
         "--continuity",
         choices=("windowed", "off"),
         default="windowed",
@@ -752,7 +912,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    global engine, voices
+    global engine, voices, describer
     voices = VoiceLibrary(args.voices_dir, args.default_voice)
     available = voices.names()
     if not available:
@@ -779,6 +939,10 @@ def main() -> None:
         dtype=args.dtype,
         continuity=args.continuity,
     )
+    if args.captioner and (args.captioner / "resampler.pt").is_file():
+        describer = VoiceDescriber(engine, args.captioner)
+    else:
+        log.info("No captioner at %s; /describe_voice disabled", args.captioner)
 
     import uvicorn
 

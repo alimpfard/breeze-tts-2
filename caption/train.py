@@ -68,6 +68,14 @@ def main() -> None:
         "--max-per-dir", type=int, default=0, help="random subsample of each dir"
     )
     parser.add_argument(
+        "--aux-only-dirs",
+        type=Path,
+        nargs="*",
+        default=[],
+        help="dirs whose records train the projector and aux heads but not the "
+        "LM: their prose is template or synthetic and would bend the captions",
+    )
+    parser.add_argument(
         "--prose",
         type=Path,
         help="jsonl {id, attrs, prose} (caption.rewrite) replacing the records' "
@@ -82,7 +90,9 @@ def main() -> None:
         recs = load_records([d])
         if args.max_per_dir and len(recs) > args.max_per_dir:
             recs = random.sample(recs, args.max_per_dir)
-        print(f"{d}: {len(recs)} records", flush=True)
+        for r in recs:
+            r["aux_only"] = d in args.aux_only_dirs
+        print(f"{d}: {len(recs)} records{' (aux only)' if d in args.aux_only_dirs else ''}", flush=True)
         records += recs
     if args.prose:
         over = {}
@@ -185,11 +195,22 @@ def main() -> None:
             if step >= total:
                 break
             chunk = train[i : i + args.batch]
-            batch = [b.to(args.device) for b in collate(chunk, tok)]
-            targets = {
-                k: v.to(args.device) for k, v in attr_targets(chunk, vocab).items()
-            }
-            lm_loss, aux = model(*batch, attr_targets=targets)
+            lm_chunk = [r for r in chunk if not r.get("aux_only")]
+            aux_chunk = [r for r in chunk if r.get("aux_only")]
+            lm_loss = aux = torch.zeros((), device=args.device)
+            if lm_chunk:
+                batch = [b.to(args.device) for b in collate(lm_chunk, tok)]
+                targets = {
+                    k: v.to(args.device) for k, v in attr_targets(lm_chunk, vocab).items()
+                }
+                lm_loss, aux = model(*batch, attr_targets=targets)
+            if aux_chunk:
+                lat, fm, _, _ = collate(aux_chunk, tok)
+                prefix = model._prefix(lat.to(args.device), fm.to(args.device))
+                targets = {
+                    k: v.to(args.device) for k, v in attr_targets(aux_chunk, vocab).items()
+                }
+                aux = aux + model.aux_loss(prefix[:, : model.cfg.queries], targets)
             loss = lm_loss + args.aux_weight * aux
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

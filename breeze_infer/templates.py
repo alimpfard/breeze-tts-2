@@ -54,7 +54,10 @@ def _tts_instruction_segments(request: Request) -> list[Segment]:
 
 
 def _tts_instruction_negative_segments(request: Request) -> list[Segment]:
-    return _tts_plain_segments(request)
+    # Same `negative_text` convention as ref_edit_tata: the unconditional row
+    # may read a shorter text than the conditioned one (lookahead endings).
+    key = "negative_text" if request.get("negative_text") else "text"
+    return [{"type": "text", "text": f"{_speaker_prefix(request)}{request[key]}"}]
 
 
 def _ref_audio_segment(

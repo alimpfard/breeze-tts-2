@@ -339,6 +339,8 @@ class Captioner(nn.Module):
     def save(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
         self.lm.save_pretrained(path / "lm")
+        # Alongside the weights, so a checkpoint loads with no hub access.
+        self.tokenizer.save_pretrained(path / "lm")
         torch.save(
             {
                 "cfg": self.cfg.__dict__,
@@ -356,7 +358,11 @@ class Captioner(nn.Module):
         model = cls(
             str(path / "lm"),
             ProjectorConfig(**state["cfg"]),
-            tokenizer_name=state.get("tokenizer", LM_NAME),
+            tokenizer_name=(
+                str(path / "lm")
+                if (path / "lm" / "tokenizer_config.json").is_file()
+                else state.get("tokenizer", LM_NAME)
+            ),
             attr_vocab=state.get("attr_vocab"),
         )
         model.resampler.load_state_dict(state["resampler"])
