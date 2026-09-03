@@ -96,14 +96,14 @@ class RoundTrip:
         )
         self.device = device
 
-    def render(self, caption: str, text: str) -> torch.Tensor | None:
+    def render(self, caption: str, text: str, seed: int = 0) -> torch.Tensor | None:
         import numpy as np
 
         from breeze_infer.runtime import set_all_seeds
         from breeze_infer.templates import get_template, prepare_inputs
 
         request = {"id": "rt", "text": text, "instruction": caption, "speaker": "S0"}
-        set_all_seeds(0)
+        set_all_seeds(seed)
         inputs = prepare_inputs(
             self.tokenizer,
             self.audio_tokenizer,
@@ -149,7 +149,14 @@ def _render_worker(device: str, breeze: Path, in_q, out_q) -> None:
 
 
 class Renderers:
-    def __init__(self, breeze: Path, devices: list[str]):
+    def __init__(
+        self, breeze: Path, devices: list[str], centre: torch.Tensor | None = None
+    ):
+        # Cosine of raw pooled latents is compressed into 0.84-0.93 by the
+        # shared mean vector: a null prompt scores 0.836 against 0.845 for
+        # the true one. Centring on the dataset mean opens that to 0.13 vs
+        # 0.23 with seed noise of 0.002, a far cleaner reward.
+        self.centre = centre.flatten() if centre is not None else None
         import torch.multiprocessing as mp
 
         ctx = mp.get_context("spawn")
@@ -180,11 +187,11 @@ class Renderers:
             if feats is None or isinstance(feats, str):
                 sims.append(-1.0)
             else:
-                sims.append(
-                    F.cosine_similarity(
-                        feats.flatten(), pooled(original).flatten(), dim=0
-                    ).item()
-                )
+                a, b = feats.flatten(), pooled(original).flatten()
+                if self.centre is not None:
+                    a, b = a - self.centre, b - self.centre
+                sims.append(F.cosine_similarity(a, b, dim=0).item())
+
         return sims
 
     def close(self):
@@ -221,6 +228,12 @@ def main() -> None:
         help="comma-separated devices, one Breeze runtime each, renders split across them",
     )
     parser.add_argument("--eval-clips", type=int, default=32)
+    parser.add_argument(
+        "--reward-centred",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="centre pooled latents on the dataset mean before the cosine",
+    )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -247,7 +260,13 @@ def main() -> None:
         else None
     )
     renderers = (
-        Renderers(args.breeze, args.roundtrip_devices.split(","))
+        Renderers(
+            args.breeze,
+            args.roundtrip_devices.split(","),
+            centre=policy.resampler.in_mean.detach().cpu()
+            if args.reward_centred
+            else None,
+        )
         if args.roundtrip
         else None
     )
