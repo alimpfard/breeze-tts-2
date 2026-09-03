@@ -679,6 +679,11 @@ async def tts_to_audio(req: TTSRequest) -> Response:
     return Response(content=buf.getvalue(), media_type="audio/wav", headers=headers)
 
 
+_TEMPLATE_STYLE_RE = re.compile(
+    r"\. The (mood is|voice has|delivery is|pitch is)|^A (man|woman|boy|girl|teenage \w+), "
+)
+
+
 class VoiceDescriber:
     """caption/ captioner over the engine's own backbone: audio + transcript
     -> a design prompt. Shares the engine lock; the backbone is not reentrant."""
@@ -706,7 +711,13 @@ class VoiceDescriber:
                 out += self.captioner.generate(
                     lat, mask, do_sample=True, temperature=0.8, top_p=0.95
                 )
-        return [o.strip() for o in out if o.strip()]
+        out = [o.strip() for o in out if o.strip()]
+        # The captioner learned mood from template-worded renders and now and
+        # then answers in that register ("A man, elderly, seventies. The mood
+        # is neutral."): correct, but one attribute where a voice needs six.
+        # Lead with a natural reading when there is one.
+        natural = [o for o in out if not _TEMPLATE_STYLE_RE.search(o)]
+        return natural + [o for o in out if o not in natural]
 
 
 def decode_upload(data: bytes, suffix: str) -> Path:
