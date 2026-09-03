@@ -25,3 +25,4 @@ htmlcov/
 # reproducible (the model re-rolls the voice on any prompt edit), so the wav
 # itself must be tracked.
 !voices/*.wav
+data/
