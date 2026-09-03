@@ -120,8 +120,13 @@ FRAME_RATE = 12.5
 # to 0.08: it has no instruction, and guidance pushes generation away from
 # its preferences), so it is read against the positive row, which wants to
 # continue into the lookahead there. Elsewhere the two rows agree.
-EOS_STOP_PROB = 0.01
+EOS_STOP_PROB = 0.006
 EOS_STOP_RATIO = 8.0
+# The stop lands a few frames into the model's own pause after the sentence
+# (0.6-0.9s of trailing silence against 0.1-0.25s for a plain render), so
+# trailing silence is trimmed back to this when a lookahead was used.
+TRAILING_SILENCE_MAX = 0.3
+TRAILING_SILENCE_DB = -40.0
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("breeze-tts")
@@ -172,6 +177,24 @@ def instruction_for(mood: str) -> str:
     if not cleaned:
         return DEFAULT_INSTRUCTION
     return DEFAULT_INSTRUCTION.replace("naturally", f"in a {cleaned} mood")
+
+
+def trim_trailing_silence(audio: np.ndarray, sample_rate: int) -> np.ndarray:
+    """Cut trailing silence back to TRAILING_SILENCE_MAX seconds."""
+    win = max(1, int(sample_rate * 0.02))
+    frames = len(audio) // win
+    if frames < 2:
+        return audio
+    rms = np.sqrt(
+        (audio[: frames * win].reshape(frames, win) ** 2).mean(axis=1) + 1e-12
+    )
+    loud = np.nonzero(20 * np.log10(rms + 1e-9) > TRAILING_SILENCE_DB)[0]
+    if len(loud) == 0:
+        return audio
+    keep = min(
+        len(audio), (int(loud[-1]) + 1) * win + int(sample_rate * TRAILING_SILENCE_MAX)
+    )
+    return audio[:keep]
 
 
 def lookahead_of(next_text: str, words: int = LOOKAHEAD_WORDS) -> str:
@@ -405,6 +428,8 @@ class BreezeEngine:
                     instruction=instruction,
                     lookahead=tail,
                 )
+                if audio.size and tail:
+                    audio = trim_trailing_silence(audio, self.sample_rate)
                 if audio.size:
                     pieces.append(audio)
                     if is_runaway(chunk, len(audio) / self.sample_rate):
