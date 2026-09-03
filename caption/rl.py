@@ -83,7 +83,7 @@ def token_logprobs(model: Captioner, prefix, ids, mask):
 
 
 class RoundTrip:
-    """Render a caption with Breeze and compare pooled latents."""
+    """Render a caption with Breeze and pool the rendered clip's latents."""
 
     def __init__(self, breeze: Path, device: str):
         from caption.gen import LatentExtractor, build_runtime
@@ -96,7 +96,7 @@ class RoundTrip:
         )
         self.device = device
 
-    def __call__(self, caption: str, text: str, original: torch.Tensor) -> float:
+    def render(self, caption: str, text: str) -> torch.Tensor | None:
         import numpy as np
 
         from breeze_infer.runtime import set_all_seeds
@@ -120,17 +120,76 @@ class RoundTrip:
             if c.codes is not None and len(c.codes)
         ]
         if not parts:
-            return -1.0
+            return None
         codes = torch.as_tensor(np.concatenate(parts), dtype=torch.int16)
         lat = self.extract(text, codes)
-        a = pool_features(
-            lat.float().unsqueeze(0), torch.ones(1, lat.shape[1], dtype=torch.bool)
-        )[0]
-        b = pool_features(
-            original.float().unsqueeze(0),
-            torch.ones(1, original.shape[1], dtype=torch.bool),
-        )[0]
-        return F.cosine_similarity(a.flatten(), b.flatten(), dim=0).item()
+        return pooled(lat)
+
+
+def pooled(lat: torch.Tensor) -> torch.Tensor:
+    return pool_features(
+        lat.float().unsqueeze(0), torch.ones(1, lat.shape[1], dtype=torch.bool)
+    )[0]
+
+
+def _render_worker(device: str, breeze: Path, in_q, out_q) -> None:
+    """One Breeze runtime per process: CUDA graphs on two devices in one
+    process trip over each other during capture."""
+    rt = RoundTrip(breeze, device)
+    out_q.put(("ready", device))
+    while True:
+        job = in_q.get()
+        if job is None:
+            return
+        job_id, caption, text = job
+        try:
+            out_q.put((job_id, rt.render(caption, text)))
+        except Exception as exc:  # noqa: BLE001
+            out_q.put((job_id, f"error: {exc}"))
+
+
+class Renderers:
+    def __init__(self, breeze: Path, devices: list[str]):
+        import torch.multiprocessing as mp
+
+        ctx = mp.get_context("spawn")
+        self.in_qs = [ctx.Queue() for _ in devices]
+        self.out_q = ctx.Queue()
+        self.procs = [
+            ctx.Process(
+                target=_render_worker, args=(d, breeze, q, self.out_q), daemon=True
+            )
+            for d, q in zip(devices, self.in_qs)
+        ]
+        for p in self.procs:
+            p.start()
+        for _ in devices:
+            print("renderer", self.out_q.get(), flush=True)
+
+    def similarities(self, jobs: list[tuple[str, str, torch.Tensor]]) -> list[float]:
+        """jobs: (caption, text, original latents) -> cosine per job, -1 on failure."""
+        for i, (caption, text, _) in enumerate(jobs):
+            self.in_qs[i % len(self.in_qs)].put((i, caption, text))
+        results = {}
+        for _ in jobs:
+            job_id, feats = self.out_q.get()
+            results[job_id] = feats
+        sims = []
+        for i, (_, _, original) in enumerate(jobs):
+            feats = results[i]
+            if feats is None or isinstance(feats, str):
+                sims.append(-1.0)
+            else:
+                sims.append(
+                    F.cosine_similarity(
+                        feats.flatten(), pooled(original).flatten(), dim=0
+                    ).item()
+                )
+        return sims
+
+    def close(self):
+        for q in self.in_qs:
+            q.put(None)
 
 
 def main() -> None:
@@ -153,6 +212,15 @@ def main() -> None:
     parser.add_argument(
         "--roundtrip", type=float, default=0.0, help="weight of the roundtrip reward"
     )
+    parser.add_argument(
+        "--likelihood", type=float, default=1.0, help="weight of the likelihood reward"
+    )
+    parser.add_argument(
+        "--roundtrip-devices",
+        default="cuda:1",
+        help="comma-separated devices, one Breeze runtime each, renders split across them",
+    )
+    parser.add_argument("--eval-clips", type=int, default=32)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -173,35 +241,54 @@ def main() -> None:
     for p in ref.parameters():
         p.requires_grad_(False)
     tok = policy.tokenizer
-    scorer = VoiceScorer(args.breeze, args.scorer_device, window_seconds=args.window)
-    roundtrip = RoundTrip(args.breeze, args.scorer_device) if args.roundtrip else None
+    scorer = (
+        VoiceScorer(args.breeze, args.scorer_device, window_seconds=args.window)
+        if args.likelihood
+        else None
+    )
+    renderers = (
+        Renderers(args.breeze, args.roundtrip_devices.split(","))
+        if args.roundtrip
+        else None
+    )
 
-    def reward(caption: str, r: dict) -> float:
-        caption = caption.strip()
-        if len(caption.split()) < 3:
-            return -1e3  # rewards are around -70; this must lose the group
-        s = -scorer.score(caption, r["text"], r["codes"]).total
-        if roundtrip is not None:
-            s = s + args.roundtrip * roundtrip(caption, r["text"], r["latents"])
-        return s
+    def rewards_for(caps: list[str], items: list[dict]) -> list[float]:
+        """One reward per (caption, clip); renders split across the runtimes."""
+        base: list[float | None] = []
+        for c, r in zip(caps, items):
+            if len(c.split()) < 3:
+                base.append(None)  # degenerate: loses the group
+            elif scorer is not None:
+                base.append(
+                    -args.likelihood * scorer.score(c, r["text"], r["codes"]).total
+                )
+            else:
+                base.append(0.0)
+        if renderers is not None:
+            idxs = [i for i, b in enumerate(base) if b is not None]
+            sims = renderers.similarities(
+                [(caps[i], items[i]["text"], items[i]["latents"]) for i in idxs]
+            )
+            for i, sim in zip(idxs, sims):
+                base[i] += args.roundtrip * sim
+        floor = min((b for b in base if b is not None), default=0.0) - 100.0
+        return [floor if b is None else b for b in base]
 
     def held_out_eval() -> tuple[float, float]:
         """Mean reward of greedy captions on held-out, policy vs reference."""
         policy.eval()
         outs = []
+        subset = held[: args.eval_clips]
         for model in (policy, ref):
             total = 0.0
-            for i in range(0, len(held), 16):
-                chunk = held[i : i + 16]
+            for i in range(0, len(subset), 16):
+                chunk = subset[i : i + 16]
                 lat, fm, _, _ = collate(chunk, tok)
                 caps = model.generate(
                     lat.to(args.device), fm.to(args.device), do_sample=False
                 )
-                total += sum(
-                    -scorer.score(c, r["text"], r["codes"]).total
-                    for c, r in zip(caps, chunk)
-                )
-            outs.append(total / len(held))
+                total += sum(rewards_for(caps, chunk))
+            outs.append(total / len(subset))
         policy.train()
         return outs[0], outs[1]
 
@@ -223,18 +310,18 @@ def main() -> None:
         ids, mask, prefix = sample_captions(policy, lat, fm, args.k, args.max_new)
         policy.train()
         caps = [
-            tok.decode(row[m], skip_special_tokens=True) for row, m in zip(ids, mask)
+            tok.decode(row[m], skip_special_tokens=True).strip()
+            for row, m in zip(ids, mask)
         ]
-        rewards = torch.tensor(
-            [reward(c, chunk[i // args.k]) for i, c in enumerate(caps)],
-            device=args.device,
-        )
+        items = [chunk[i // args.k] for i in range(len(caps))]
+        rewards = torch.tensor(rewards_for(caps, items), device=args.device)
         groups = rewards.view(args.batch, args.k)
         adv = (groups - groups.mean(1, keepdim=True)) / (
             groups.std(1, keepdim=True) + 1e-4
         )
         adv = adv.view(-1)
 
+        policy.lm.gradient_checkpointing_enable()
         lp, n_tok = token_logprobs(policy, prefix.detach(), ids, mask)
         with torch.no_grad():
             lp_ref, _ = token_logprobs(ref, prefix.detach(), ids, mask)
@@ -249,6 +336,7 @@ def main() -> None:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
         opt.step()
+        policy.lm.gradient_checkpointing_disable()
 
         if step % 10 == 0:
             length = n_tok.float().mean().item()
@@ -267,6 +355,8 @@ def main() -> None:
     pol, base = held_out_eval()
     print(f"held-out reward after: policy {pol:.3f}  reference {base:.3f}")
     policy.save(args.out)
+    if renderers is not None:
+        renderers.close()
     print(f"saved to {args.out}")
 
 
