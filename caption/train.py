@@ -6,6 +6,7 @@ python -m caption.train data/caption/latents --out data/caption/captioner
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import random
 import sys
@@ -60,11 +61,29 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--projector", choices=("pool", "attn"), default="pool")
     parser.add_argument("--aux-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--prose",
+        type=Path,
+        help="jsonl {id, attrs, prose} (caption.rewrite) replacing the records' "
+        "requested labels with relabelled ones; records without an entry are dropped",
+    )
     args = parser.parse_args()
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     records = load_records(args.dirs)
+    if args.prose:
+        over = {}
+        for line in args.prose.read_text().splitlines():
+            d = json.loads(line)
+            over[d["id"]] = d
+        kept = []
+        for r in records:
+            if r["id"] in over:
+                r["prose"], r["attrs"] = over[r["id"]]["prose"], over[r["id"]]["attrs"]
+                kept.append(r)
+        print(f"{len(kept)}/{len(records)} records have relabelled prose", flush=True)
+        records = kept
     random.shuffle(records)
     n_hold = max(32, int(len(records) * args.holdout))
     held, train = records[:n_hold], records[n_hold:]
