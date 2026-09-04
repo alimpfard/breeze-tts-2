@@ -385,7 +385,9 @@ class BackboneGraph:
         self.position_ids.copy_((self._base_position + step_idx).unsqueeze(-1))
         # KV cache slot: prefill_len + step_idx (append after prefill KV, never overwrite)
         self.cache_position[0] = self._prefill_len + step_idx
-        self._set_attention_mask(self.cache_position[0].item())
+        # Host-side arithmetic: reading cache_position back would sync the
+        # stream every frame, draining the queue before the next replay.
+        self._set_attention_mask(int(self._prefill_len) + step_idx)
         if self.no_graph:
             self._decode_step()
         else:
