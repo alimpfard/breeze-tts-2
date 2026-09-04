@@ -60,10 +60,23 @@ class FusedDecoderLayer(nn.Module):
     def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_values=None,
                 use_cache=False, cache_position=None, position_embeddings=None, **kwargs):
         layers = getattr(past_key_values, "layers", None)
-        if hidden_states.shape[1] != 1 or layers is None or position_embeddings is None or attention_mask is None:
+        T = hidden_states.shape[1]
+        if layers is None or position_embeddings is None or attention_mask is None or T > 4:
             return self.orig(hidden_states, attention_mask=attention_mask, position_ids=position_ids,
                              past_key_values=past_key_values, use_cache=use_cache, cache_position=cache_position,
                              position_embeddings=position_embeddings, **kwargs)
+        if T > 1:
+            # A short prefill (the depth decoder's 2-position start) is exactly
+            # T causal decode steps: same rope, same mask rows, same cache.
+            cos, sin = position_embeddings
+            outs = []
+            for t in range(T):
+                outs.append(self.forward(
+                    hidden_states[:, t : t + 1], attention_mask=attention_mask[:, :, t : t + 1],
+                    position_ids=None if position_ids is None else position_ids[:, t : t + 1],
+                    past_key_values=past_key_values, use_cache=use_cache, cache_position=cache_position[t : t + 1],
+                    position_embeddings=(cos[:, t : t + 1], sin[:, t : t + 1])))
+            return torch.cat(outs, dim=1)
         layer_cache = layers[self.layer_idx]
         if not layer_cache.is_initialized:
             layer_cache.lazy_initialization(hidden_states.new_zeros(hidden_states.shape[0], self.hkv, 1, self.hd))

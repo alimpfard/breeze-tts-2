@@ -69,6 +69,22 @@ def main() -> None:
             steps = min(args.steps, seq - 2)
             ref, last = run_layer(layer, bb, c1, steps, B, dev, dtype)
             out, _ = run_layer(fused, bb, c2, steps, B, dev, dtype)
+            if name == "depth":
+                # the graph's 2-position prefill: one call with T=2 on fresh caches
+                c3 = StaticCache(config=bb.config, max_cache_len=seq, batch_size=B)
+                c4 = StaticCache(config=bb.config, max_cache_len=seq, batch_size=B)
+                x2 = torch.randn(B, 2, bb.config.hidden_size, device=dev, dtype=dtype) * 0.5
+                pos2 = torch.tensor([0, 1], device=dev)
+                pid2 = pos2.unsqueeze(0).expand(B, 2)
+                m2 = torch.full((B, 1, 2, seq), torch.finfo(dtype).min, device=dev, dtype=dtype)
+                m2[:, :, 0, :1] = 0
+                m2[:, :, 1, :2] = 0
+                cs2 = bb.rotary_emb(x2, pid2)
+                r2 = layer(x2, attention_mask=m2, position_ids=pid2, past_key_values=c3, use_cache=True, cache_position=pos2, position_embeddings=cs2)
+                r2 = r2[0] if isinstance(r2, tuple) else r2
+                o2 = fused(x2, attention_mask=m2, position_ids=pid2, past_key_values=c4, use_cache=True, cache_position=pos2, position_embeddings=cs2)
+                perr = ((r2.float() - o2.float()).abs().max() / r2.float().abs().max()).item()
+                print(f"{name:<8} {variant:<14} layer {li:2d}: prefill(T=2) rel err {perr:.4f}", flush=True)
             err = (ref - out).abs().max().item() / ref.abs().max().item()
             # the caches must agree too
             k1, k2 = c1.layers[li].keys, c2.layers[li].keys
