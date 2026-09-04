@@ -17,6 +17,18 @@ from torch import nn
 from .kernels import FusedWeight, attention_step, rms_gemv, rmsnorm, silu_mul
 
 
+def _from_fp8(*mods) -> FusedWeight:
+    """Adopt Fp8Linear buffers (fp8 e4m3 (N, K), per-row scale (1, N)) as-is,
+    concatenated along N."""
+    fw = FusedWeight.__new__(FusedWeight)
+    fw.bits = 8
+    fw.w = torch.cat([m.weight_fp8 for m in mods], 0).contiguous()
+    fw.s = torch.cat([m.weight_scale.reshape(-1) for m in mods], 0).float().contiguous()
+    fw.z = None
+    fw.N, fw.K = fw.w.shape
+    return fw
+
+
 class FusedDecoderLayer(nn.Module):
     def __init__(self, layer: nn.Module, layer_idx: int, mlp_bits: int | None = None):
         super().__init__()
@@ -37,6 +49,9 @@ class FusedDecoderLayer(nn.Module):
         self.tinygemm = type(mlp.gate_proj).__name__ == "Int4Linear"
         if self.tinygemm:
             self.gate, self.up, self.down = mlp.gate_proj, mlp.up_proj, mlp.down_proj
+        elif type(mlp.gate_proj).__name__ == "Fp8Linear":
+            self.wgu = _from_fp8(mlp.gate_proj, mlp.up_proj)
+            self.wd = _from_fp8(mlp.down_proj)
         else:
             bits = mlp_bits or 16
             self.wgu = FusedWeight(torch.cat([mlp.gate_proj.weight, mlp.up_proj.weight], 0).detach(), bits)

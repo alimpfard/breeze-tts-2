@@ -45,43 +45,44 @@ def rms_gemv_kernel(
     stride_x,
     WBITS: tl.constexpr, NORM: tl.constexpr,
     BLOCK_N: tl.constexpr, SPLIT_K: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_K: tl.constexpr,
+    M_PAD: tl.constexpr,
 ):
     """Partial products over a K slice into part[split, M, N] (fp32; the fp8
-    row scale is applied in the epilogue). Every program recomputes the rms
-    of x: a K-long read from L2, cheaper than a launch."""
+    row scale is applied in the epilogue). Streaming GEMV: a (BLOCK_N,
+    BLOCK_K) weight tile is read once and reduced against each of the M rows.
+    Every program recomputes the rms of x: a K-long read from L2, cheaper than
+    a launch."""
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
-    rows = tl.arange(0, 16)
-    rmask = rows < M
     n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     nmask = n < N
     k_per = K // SPLIT_K
     k_lo = pid_k * k_per
     NG: tl.constexpr = BLOCK_K // GROUP_K
+    rows = tl.arange(0, M_PAD)
+    rmask = rows < M
 
-    inv = tl.zeros([16], dtype=tl.float32)
+    inv = tl.zeros([M_PAD], dtype=tl.float32)
     if NORM:
-        ss = tl.zeros([16], dtype=tl.float32)
+        ss = tl.zeros([M_PAD], dtype=tl.float32)
         for k0 in range(0, K, BLOCK_K):
             ks = k0 + tl.arange(0, BLOCK_K)
             xk = tl.load(x_ptr + rows[:, None] * stride_x + ks[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
             ss += tl.sum(xk * xk, 1)
         inv = 1.0 / tl.sqrt(ss / K + eps)
 
-    acc = tl.zeros([16, BLOCK_N], dtype=tl.float32)
+    acc = tl.zeros([M_PAD, BLOCK_N], dtype=tl.float32)
     for k0 in range(k_lo, k_lo + k_per, BLOCK_K):
         ks = k0 + tl.arange(0, BLOCK_K)
         xk = tl.load(x_ptr + rows[:, None] * stride_x + ks[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
         if NORM:
             nw = tl.load(nw_ptr + ks).to(tl.float32)
             xk = xk * inv[:, None] * nw[None, :]
-        xb = xk.to(tl.bfloat16)
         if WBITS == 16:
-            w = tl.load(w_ptr + n[:, None] * K + ks[None, :], mask=nmask[:, None], other=0.0)
+            w = tl.load(w_ptr + n[:, None] * K + ks[None, :], mask=nmask[:, None], other=0.0).to(tl.float32)
         elif WBITS == 8:
-            w = tl.load(w_ptr + n[:, None] * K + ks[None, :], mask=nmask[:, None], other=0.0).to(tl.bfloat16)
+            w = tl.load(w_ptr + n[:, None] * K + ks[None, :], mask=nmask[:, None], other=0.0).to(tl.float32)
         else:
-            # int4: byte j of row n holds k=2j (low nibble) and k=2j+1 (high).
             kh = k0 // 2 + tl.arange(0, BLOCK_K // 2)
             packed = tl.load(w_ptr + n[:, None] * (K // 2) + kh[None, :], mask=nmask[:, None], other=0)
             lo = (packed & 15).to(tl.float32)
@@ -90,8 +91,9 @@ def rms_gemv_kernel(
             gs = k0 // GROUP_K + tl.arange(0, NG)
             sc = tl.load(s_ptr + n[:, None] * (K // GROUP_K) + gs[None, :], mask=nmask[:, None], other=0.0).to(tl.float32)
             mn = tl.load(z_ptr + n[:, None] * (K // GROUP_K) + gs[None, :], mask=nmask[:, None], other=0.0).to(tl.float32)
-            w = tl.reshape(q * sc[:, :, None] + mn[:, :, None], (BLOCK_N, BLOCK_K)).to(tl.bfloat16)
-        acc += tl.dot(xb, tl.trans(w))
+            w = tl.reshape(q * sc[:, :, None] + mn[:, :, None], (BLOCK_N, BLOCK_K))
+        # (M_PAD, 1, BLOCK_K) * (1, BLOCK_N, BLOCK_K) -> reduce K
+        acc += tl.sum(xk[:, None, :] * w[None, :, :], 2)
     tl.store(part_ptr + (pid_k * M + rows[:, None]) * N + n[None, :], acc, mask=rmask[:, None] & nmask[None, :])
 
 
@@ -172,10 +174,10 @@ _BEST: dict[tuple, tuple] = {}
 # (BLOCK_N, SPLIT_K, num_warps, num_stages) candidates; a shape is timed once.
 _CANDIDATES = [
     (bn, sk, bk, nw, st)
-    for bn in (16, 32, 64)
-    for sk in (1, 2, 4, 8, 16, 32, 64)
-    for bk in (128, 256, 512)
-    for nw in (2, 4)
+    for bn in (4, 8, 16, 32)
+    for sk in (1, 2, 4, 8)
+    for bk in (256, 512, 1024)
+    for nw in (2, 4, 8)
     for st in (2, 3)
 ]
 
@@ -200,7 +202,8 @@ def _launch(cfg, x, fw, norm_weight, eps, epilogue, residual, out, part):
         norm_weight if norm_weight is not None else dummy, part,
         M, N, K, eps, x.stride(0),
         WBITS=fw.bits, NORM=norm_weight is not None,
-        BLOCK_N=bn, SPLIT_K=sk, BLOCK_K=bk, GROUP_K=GROUP, num_warps=nw, num_stages=st,
+        BLOCK_N=bn, SPLIT_K=sk, BLOCK_K=bk, GROUP_K=GROUP, M_PAD=2 if M <= 2 else 4,
+        num_warps=nw, num_stages=st,
     )
     gemv_epilogue_kernel[(triton.cdiv(n_out, 1024), M)](
         part, fw.s if fw.s is not None else dummy, residual if residual is not None else dummy, out,
@@ -233,15 +236,39 @@ def graph_time_us(fn, iters: int = 20) -> float:
     return s_ev.elapsed_time(e_ev) / (5 * iters) * 1000
 
 
+def _cold_copies(fw: FusedWeight, budget_bytes: int = 160 << 20) -> list:
+    """Copies of the weight to rotate through so a timing loop streams from
+    DRAM rather than replaying an L2-resident tensor."""
+    nbytes = fw.w.numel() * fw.w.element_size()
+    n = max(2, min(12, budget_bytes // max(nbytes, 1)))
+    copies = []
+    for _ in range(n):
+        c = FusedWeight.__new__(FusedWeight)
+        c.bits, c.N, c.K = fw.bits, fw.N, fw.K
+        c.w = fw.w.clone()
+        c.s = fw.s.clone() if fw.s is not None else None
+        c.z = fw.z.clone() if fw.z is not None else None
+        copies.append(c)
+    return copies
+
+
 def _tune(key, x, fw, norm_weight, eps, epilogue, residual, out, part) -> tuple:
     best, best_t = None, float("inf")
     K = x.shape[1]
+    copies = _cold_copies(fw)
+    state = {"i": 0}
+
+    def rotate(cfg):
+        c = copies[state["i"] % len(copies)]
+        state["i"] += 1
+        _launch(cfg, x, c, norm_weight, eps, epilogue, residual, out, part)
+
     for cfg in _CANDIDATES:
         bn, sk, bk, nw, st = cfg
         if (K // sk) % bk:
             continue
         try:
-            t = graph_time_us(lambda: _launch(cfg, x, fw, norm_weight, eps, epilogue, residual, out, part))
+            t = graph_time_us(lambda: rotate(cfg), iters=len(copies) * 2)
         except Exception:
             continue
         if t < best_t:
@@ -325,34 +352,98 @@ def qkv_rope_cache_kernel(
 
 @triton.jit
 def attn_decode_kernel(
-    q_ptr, k_cache_ptr, v_cache_ptr, mask_ptr, out_ptr,
+    q_ptr, k_cache_ptr, v_cache_ptr, mask_ptr, pos_ptr, part_ptr, out_ptr,
     stride_mask, stride_out, scale,
-    HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr, S: tl.constexpr, BLOCK_S: tl.constexpr,
+    HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr, S: tl.constexpr,
+    BLOCK_S: tl.constexpr, SPLIT: tl.constexpr,
 ):
-    """One program per (batch row, q head): softmax(q k^T * scale + mask) v over
-    the whole static cache. mask is additive (B, S), float."""
+    """One program per (batch row, q head, S split): softmax(q k^T * scale +
+    mask) v over the cache positions [0, pos] -- the static cache beyond the
+    current position is never valid, so it is never read. With SPLIT > 1
+    each program writes (m, l, acc) partials for attn_combine_kernel."""
     b = tl.program_id(0)
     h = tl.program_id(1)
+    sp = tl.program_id(2)
     j = h // (HQ // HKV)
     d = tl.arange(0, D)
     q = tl.load(q_ptr + (b * HQ + h) * D + d) * scale
+    kv_len = tl.load(pos_ptr) + 1
+    per = (kv_len + SPLIT - 1) // SPLIT
+    s_lo = sp * per
+    s_hi = tl.minimum(s_lo + per, kv_len)
     m = tl.full([1], -1e30, dtype=tl.float32)
     l = tl.zeros([1], dtype=tl.float32)
     acc = tl.zeros([D], dtype=tl.float32)
     kv_base = (b * HKV + j) * S * D
-    for s0 in range(0, S, BLOCK_S):
+    for s0 in range(s_lo, s_hi, BLOCK_S):
         ss = s0 + tl.arange(0, BLOCK_S)
-        k = tl.load(k_cache_ptr + kv_base + ss[:, None] * D + d[None, :]).to(tl.float32)
-        scores = tl.sum(k * q[None, :], 1) + tl.load(mask_ptr + b * stride_mask + ss).to(tl.float32)
+        smask = ss < s_hi
+        k = tl.load(k_cache_ptr + kv_base + ss[:, None] * D + d[None, :], mask=smask[:, None], other=0.0).to(tl.float32)
+        scores = tl.sum(k * q[None, :], 1) + tl.load(mask_ptr + b * stride_mask + ss, mask=smask, other=-1e30).to(tl.float32)
+        scores = tl.where(smask, scores, -1e30)
         m_new = tl.maximum(m, tl.max(scores, 0))
         alpha = tl.exp(m - m_new)
         p = tl.exp(scores - m_new)
-        v = tl.load(v_cache_ptr + kv_base + ss[:, None] * D + d[None, :]).to(tl.float32)
+        v = tl.load(v_cache_ptr + kv_base + ss[:, None] * D + d[None, :], mask=smask[:, None], other=0.0).to(tl.float32)
         acc = acc * alpha + tl.sum(p[:, None] * v, 0)
         l = l * alpha + tl.sum(p, 0)
         m = m_new
-    out = acc / l
-    tl.store(out_ptr + b * stride_out + h * D + d, out.to(out_ptr.dtype.element_ty))
+    if SPLIT == 1:
+        out = acc / l
+        tl.store(out_ptr + b * stride_out + h * D + d, out.to(out_ptr.dtype.element_ty))
+    else:
+        base = ((b * HQ + h) * SPLIT + sp) * (D + 2)
+        tl.store(part_ptr + base + d, acc)
+        tl.store(part_ptr + base + D + tl.arange(0, 1), m)
+        tl.store(part_ptr + base + D + 1 + tl.arange(0, 1), l)
+
+
+@triton.jit
+def attn_combine_kernel(part_ptr, out_ptr, stride_out, HQ: tl.constexpr, D: tl.constexpr, SPLIT: tl.constexpr):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    d = tl.arange(0, D)
+    base = (b * HQ + h) * SPLIT * (D + 2)
+    m = tl.full([1], -1e30, dtype=tl.float32)
+    for sp in range(SPLIT):
+        m = tl.maximum(m, tl.load(part_ptr + base + sp * (D + 2) + D + tl.arange(0, 1)))
+    l = tl.zeros([1], dtype=tl.float32)
+    acc = tl.zeros([D], dtype=tl.float32)
+    for sp in range(SPLIT):
+        ms = tl.load(part_ptr + base + sp * (D + 2) + D + tl.arange(0, 1))
+        ls = tl.load(part_ptr + base + sp * (D + 2) + D + 1 + tl.arange(0, 1))
+        w = tl.exp(ms - m)
+        acc += tl.load(part_ptr + base + sp * (D + 2) + d) * w
+        l += ls * w
+    tl.store(out_ptr + b * stride_out + h * D + d, (acc / l).to(out_ptr.dtype.element_ty))
+
+
+_ATTN_PART: dict[tuple, torch.Tensor] = {}
+
+
+def _attn_partials(B, HQ, D, split, device):
+    key = (B, HQ, D, split, str(device))
+    buf = _ATTN_PART.get(key)
+    if buf is None:
+        buf = torch.empty(B * HQ * split * (D + 2), device=device, dtype=torch.float32)
+        _ATTN_PART[key] = buf
+    return buf
+
+
+_MASKS: dict[tuple, torch.Tensor] = {}
+
+
+def _additive_mask(mask, B: int, S: int) -> torch.Tensor:
+    """(B, 1, Q, S) float additive or bool -> (B, S) float additive. Static
+    mask buffers (same storage, same shape) are converted once."""
+    if mask.dtype != torch.bool:
+        return mask.reshape(B, -1)[:, :S] if mask.shape[-1] != S else mask.reshape(B, S)
+    key = (mask.data_ptr(), tuple(mask.shape), str(mask.device))
+    m2 = _MASKS.get(key)
+    if m2 is None:
+        m2 = torch.where(mask.reshape(B, -1)[:, :S], 0.0, -1e30).float().contiguous()
+        _MASKS[key] = m2
+    return m2
 
 
 def attention_step(qkv, cos, sin, cache_position, keys, values, mask, q_norm_w=None, k_norm_w=None, eps=1e-6, out=None, q_buf=None):
@@ -365,20 +456,27 @@ def attention_step(qkv, cos, sin, cache_position, keys, values, mask, q_norm_w=N
         q_buf = torch.empty(B, HQ, D, device=qkv.device, dtype=torch.float32)
     if out is None:
         out = torch.empty(B, HQ * D, device=qkv.device, dtype=torch.bfloat16)
-    cos2 = cos.reshape(B, -1)
-    sin2 = sin.reshape(B, -1)
+    # cos/sin come as (B, 1, D) or (1, 1, D) (the depth graph computes them
+    # for one position id and broadcasts); a zero batch stride handles both.
+    cos2 = cos.reshape(cos.shape[0], -1).contiguous()
+    sin2 = sin.reshape(sin.shape[0], -1).contiguous()
+    stride_cs = cos2.stride(0) if cos2.shape[0] == B else 0
     dummy = out
     qkv_rope_cache_kernel[(B, HQ + HKV)](
         qkv, q_norm_w if q_norm_w is not None else dummy, k_norm_w if k_norm_w is not None else dummy,
         cos2, sin2, cache_position, q_buf, keys, values,
-        qkv.stride(0), cos2.stride(0), eps,
+        qkv.stride(0), stride_cs, eps,
         HQ=HQ, HKV=HKV, D=D, S=S, QK_NORM=q_norm_w is not None, num_warps=1,
     )
-    mask2 = mask.reshape(B, -1)
-    attn_decode_kernel[(B, HQ)](
-        q_buf, keys, values, mask2, out, mask2.stride(0), out.stride(0), D ** -0.5,
-        HQ=HQ, HKV=HKV, D=D, S=S, BLOCK_S=64, num_warps=4,
+    mask2 = _additive_mask(mask, B, S)
+    split = 1 if S <= 256 else 8
+    part = _attn_partials(B, HQ, D, split, qkv.device)
+    attn_decode_kernel[(B, HQ, split)](
+        q_buf, keys, values, mask2, cache_position, part, out, mask2.stride(0), out.stride(0), D ** -0.5,
+        HQ=HQ, HKV=HKV, D=D, S=S, BLOCK_S=64 if S <= 256 else 128, SPLIT=split, num_warps=4,
     )
+    if split > 1:
+        attn_combine_kernel[(B, HQ)](part, out, out.stride(0), HQ=HQ, D=D, SPLIT=split, num_warps=1)
     return out
 
 

@@ -28,7 +28,7 @@ def main() -> None:
     p.add_argument("--device", default=None)
     p.add_argument("--cfg-scale", type=float, default=1.5)
     p.add_argument("--fast-profile", type=Path, default=Path("configs/fast_service.json"))
-    p.add_argument("--no-pipelined", action="store_true")
+    p.add_argument("--fused", action="store_true")
     p.add_argument("--wall", action="store_true", help="no stage timers (they sync); wall clock only")
     p.add_argument("--out", type=Path, help="save the timed render as wav")
     p.add_argument("--next-text", default="", help="exercise the lookahead stop rule")
@@ -37,7 +37,7 @@ def main() -> None:
     engine = srv.BreezeEngine(
         args.model, cfg_scale=args.cfg_scale, seed=42, fast=True, fast_stages="decode",
         fast_profile=args.fast_profile, fp8=args.fp8, int4=args.int4, device=args.device,
-        pipelined=not args.no_pipelined,
+        fused=args.fused,
     )
     rt = engine.runtime
     acc = {"backbone": 0.0, "depth": 0.0, "codec": 0.0}
@@ -58,7 +58,6 @@ def main() -> None:
         rt._backbone_graph.run = timed("backbone", rt._backbone_graph.run)
         rt._depth_decoder_graph.run = timed("depth", rt._depth_decoder_graph.run)
         rt._decode_codec_frames = timed("codec", rt._decode_codec_frames)
-        rt._decode_codec_frames_async = timed("codec", rt._decode_codec_frames_async)
 
     voice = srv.VoiceLibrary(args.voices_dir, "default").get("default")
     text = "It was not an unfriendly silence, Mira had learned over three seasons, but the silence of people who had run out of things to say."
@@ -71,7 +70,7 @@ def main() -> None:
     wall = time.perf_counter() - t
     sec = len(audio) / engine.sample_rate
     frames = calls["depth"] or int(round(sec * 12.5))
-    mode = "pipelined" if engine.runtime.config.pipelined else "syncing"
+    mode = "fused" if args.fused else "stock"
     print(f"{mode}: {sec:.1f}s audio, {frames} frames, wall {wall:.2f}s = {sec / wall:.2f}x realtime, {wall / frames * 1000:.1f} ms/frame, cond {sum(len(t.codes) for t in turns)} codes")
     if args.out:
         import soundfile as sf

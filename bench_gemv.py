@@ -4,7 +4,20 @@ sys.path.insert(0, ".")
 from models.fused.kernels import FusedWeight, rms_gemv
 
 dev = "cuda:0"
-from models.fused.kernels import graph_time_us as t
+from models.fused.kernels import graph_time_us, _cold_copies
+
+
+def t(fn):
+    return graph_time_us(fn, iters=24)
+
+
+def t_cold(fn_of_weight, fw):
+    copies = _cold_copies(fw)
+    st = {"i": 0}
+    def rot():
+        c = copies[st["i"] % len(copies)]; st["i"] += 1
+        fn_of_weight(c)
+    return graph_time_us(rot, iters=len(copies) * 2)
 
 M = 2
 for name, K, N, epi in (("bb qkv 2048->4096", 2048, 4096, 0), ("bb gate|up 2048->2x6144 silu", 2048, 12288, 1), ("bb down 6144->2048 +res", 6144, 2048, 2),
@@ -20,7 +33,12 @@ for name, K, N, epi in (("bb qkv 2048->4096", 2048, 4096, 0), ("bb gate|up 2048-
         if epi == 1: g, u = y[:, :N // 2], y[:, N // 2:]; return torch.nn.functional.silu(g) * u
         if epi == 2: return y + res.float()
         return y
-    base_bf16 = t(lambda: torch.nn.functional.linear(x, Wb))
+    Wcopies = [Wb.clone() for _ in range(max(2, min(12, (160 << 20) // Wb.numel() // 2)))]
+    st = {"i": 0}
+    def cublas_cold():
+        w = Wcopies[st["i"] % len(Wcopies)]; st["i"] += 1
+        torch.nn.functional.linear(x, w)
+    base_bf16 = graph_time_us(cublas_cold, iters=len(Wcopies) * 2)
     line = f"{name:<32} bf16 cublas {base_bf16:6.1f}us"
     for bits in (16, 8, 4):
         try:
@@ -33,7 +51,7 @@ for name, K, N, epi in (("bb qkv 2048->4096", 2048, 4096, 0), ("bb gate|up 2048-
                 q = torch.stack([fw.w & 15, fw.w >> 4], -1).reshape(N, K).float()
                 w_eff = q * fw.s.float().repeat_interleave(128, 1) + fw.z.float().repeat_interleave(128, 1)
             err = (out.float() - ref(w_eff)).abs().max().item() / (ref(w_eff).abs().max().item() + 1e-6)
-            us = t(lambda: rms_gemv(x, fw, nw, epilogue=epi, residual=res if epi == 2 else None))
+            us = t_cold(lambda c: rms_gemv(x, c, nw, epilogue=epi, residual=res if epi == 2 else None), fw)
             line += f" | fused{bits:>2} {us:6.1f}us err {err:.3f}"
         except Exception as ex:
             line += f" | fused{bits:>2} FAIL {type(ex).__name__}: {str(ex)[:60]}"

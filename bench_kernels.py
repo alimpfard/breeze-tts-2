@@ -23,10 +23,12 @@ def main() -> None:
     p.add_argument("--int4", default="off")
     p.add_argument("--device", default=None)
     p.add_argument("--top", type=int, default=30)
+    p.add_argument("--fused", action="store_true")
     args = p.parse_args()
     engine = srv.BreezeEngine(
         args.model, cfg_scale=1.5, seed=42, fast=True, fast_stages="decode",
         fast_profile=Path("configs/fast_service.json"), fp8=args.fp8, int4=args.int4, device=args.device,
+        fused=args.fused,
     )
     voice = srv.VoiceLibrary(args.voices_dir, "default").get("default")
     text = "It was not an unfriendly silence, Mira had learned over three seasons."

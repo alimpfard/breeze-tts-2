@@ -337,6 +337,7 @@ class BreezeEngine:
         dtype: str = "bfloat16",
         max_seq_len: int = MAX_SEQ_LEN,
         continuity: str = "windowed",
+        fused: bool = False,
     ) -> None:
         self.cfg_scale = cfg_scale
         self.seed = seed
@@ -398,6 +399,13 @@ class BreezeEngine:
                 "low-memory load complete: %.2f GB allocated",
                 torch.cuda.memory_allocated() / 1024**3,
             )
+
+        if fused:
+            from models.fused.install import install_fused_backbone, install_fused_depth
+
+            n = install_fused_backbone(model, batch_size=2, max_seq_len=max_seq_len)
+            m = install_fused_depth(model, batch_size=2)
+            log.info("Fused decode kernels installed on %d backbone and %d depth layers", n, m)
 
         config = FastStreamingConfig(
             max_new_tokens=MAX_NEW_TOKENS,
@@ -907,6 +915,11 @@ def main() -> None:
     )
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
     parser.add_argument(
+        "--fused",
+        action="store_true",
+        help="Triton-fused decode layers on the backbone (models/fused)",
+    )
+    parser.add_argument(
         "--captioner",
         type=Path,
         default=REPO_ROOT / "data/caption/captioner",
@@ -949,6 +962,7 @@ def main() -> None:
         device=args.device,
         dtype=args.dtype,
         continuity=args.continuity,
+        fused=args.fused,
     )
     if args.captioner and (args.captioner / "resampler.pt").is_file():
         describer = VoiceDescriber(engine, args.captioner)

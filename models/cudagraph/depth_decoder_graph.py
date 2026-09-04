@@ -178,6 +178,8 @@ class DepthDecoderGraph:
             else:
                 _log.info("Compiling depth decoder with the fast configuration.")
                 for index, layer in enumerate(self.depth_model.layers):
+                    if type(layer).__name__ == "FusedDecoderLayer":
+                        continue  # hand-fused Triton path; dynamo has nothing to add
                     self.depth_model.layers[index] = torch.compile(
                         layer, mode=compile_mode, fullgraph=True
                     )
