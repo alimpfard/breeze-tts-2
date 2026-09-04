@@ -30,7 +30,7 @@ def _from_fp8(*mods) -> FusedWeight:
 
 
 class FusedDecoderLayer(nn.Module):
-    def __init__(self, layer: nn.Module, layer_idx: int, mlp_bits: int | None = None):
+    def __init__(self, layer: nn.Module, layer_idx: int, mlp_bits: int | None = None, attn_bits: int = 16):
         super().__init__()
         self.orig = layer
         self.layer_idx = layer_idx
@@ -43,8 +43,11 @@ class FusedDecoderLayer(nn.Module):
         self.qn = getattr(attn, "q_norm", None).weight if getattr(attn, "q_norm", None) is not None else None
         self.kn = getattr(attn, "k_norm", None).weight if getattr(attn, "k_norm", None) is not None else None
         wq, wk, wv = attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight
-        self.wqkv = FusedWeight(torch.cat([wq, wk, wv], 0).detach(), 16)
-        self.wo = FusedWeight(attn.o_proj.weight.detach(), 16)
+        # Attention projections stay bf16 in the stock path because _scaled_mm
+        # was slower than cuBLAS on them; the fused GEMV has no such problem,
+        # so attn_bits=8 halves their bytes (per-row fp8, same as the MLP).
+        self.wqkv = FusedWeight(torch.cat([wq, wk, wv], 0).detach(), attn_bits)
+        self.wo = FusedWeight(attn.o_proj.weight.detach(), attn_bits)
         mlp = layer.mlp
         self.tinygemm = type(mlp.gate_proj).__name__ == "Int4Linear"
         if self.tinygemm:

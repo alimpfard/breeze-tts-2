@@ -13,13 +13,13 @@ from transformers import StaticCache
 from .layer import FusedDecoderLayer
 
 
-def install_fused_backbone(model, *, batch_size: int = 2, max_seq_len: int = 1024, mlp_bits: int | None = None) -> int:
+def install_fused_backbone(model, *, batch_size: int = 2, max_seq_len: int = 1024, mlp_bits: int | None = None, attn_bits: int = 16) -> int:
     bb = model.backbone_model
     n = 0
     for i, layer in enumerate(bb.layers):
         if isinstance(layer, FusedDecoderLayer):
             continue
-        bb.layers[i] = FusedDecoderLayer(layer, i, mlp_bits=mlp_bits)
+        bb.layers[i] = FusedDecoderLayer(layer, i, mlp_bits=mlp_bits, attn_bits=attn_bits)
         n += 1
     # Exercise every kernel shape once (tunes and compiles) on a scratch cache.
     dev = next(bb.parameters()).device
@@ -39,13 +39,13 @@ def install_fused_backbone(model, *, batch_size: int = 2, max_seq_len: int = 102
     return n
 
 
-def install_fused_depth(model, *, batch_size: int = 2, mlp_bits: int | None = None) -> int:
+def install_fused_depth(model, *, batch_size: int = 2, mlp_bits: int | None = None, attn_bits: int = 16) -> int:
     dm = model.depth_decoder.model
     n = 0
     for i, layer in enumerate(dm.layers):
         if isinstance(layer, FusedDecoderLayer):
             continue
-        dm.layers[i] = FusedDecoderLayer(layer, i, mlp_bits=mlp_bits)
+        dm.layers[i] = FusedDecoderLayer(layer, i, mlp_bits=mlp_bits, attn_bits=attn_bits)
         n += 1
     dev = next(dm.parameters()).device
     dtype = next(dm.parameters()).dtype

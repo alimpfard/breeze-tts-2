@@ -29,6 +29,7 @@ def main() -> None:
     p.add_argument("--cfg-scale", type=float, default=1.5)
     p.add_argument("--fast-profile", type=Path, default=Path("configs/fast_service.json"))
     p.add_argument("--fused", action="store_true")
+    p.add_argument("--fused-attn-bits", type=int, default=16)
     p.add_argument("--wall", action="store_true", help="no stage timers (they sync); wall clock only")
     p.add_argument("--out", type=Path, help="save the timed render as wav")
     p.add_argument("--next-text", default="", help="exercise the lookahead stop rule")
@@ -37,7 +38,7 @@ def main() -> None:
     engine = srv.BreezeEngine(
         args.model, cfg_scale=args.cfg_scale, seed=42, fast=True, fast_stages="decode",
         fast_profile=args.fast_profile, fp8=args.fp8, int4=args.int4, device=args.device,
-        fused=args.fused,
+        fused=args.fused, fused_attn_bits=args.fused_attn_bits,
     )
     rt = engine.runtime
     acc = {"backbone": 0.0, "depth": 0.0, "codec": 0.0}

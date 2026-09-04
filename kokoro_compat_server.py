@@ -338,6 +338,7 @@ class BreezeEngine:
         max_seq_len: int = MAX_SEQ_LEN,
         continuity: str = "windowed",
         fused: bool = False,
+        fused_attn_bits: int = 16,
     ) -> None:
         self.cfg_scale = cfg_scale
         self.seed = seed
@@ -403,8 +404,8 @@ class BreezeEngine:
         if fused:
             from models.fused.install import install_fused_backbone, install_fused_depth
 
-            n = install_fused_backbone(model, batch_size=2, max_seq_len=max_seq_len)
-            m = install_fused_depth(model, batch_size=2)
+            n = install_fused_backbone(model, batch_size=2, max_seq_len=max_seq_len, attn_bits=fused_attn_bits)
+            m = install_fused_depth(model, batch_size=2, attn_bits=fused_attn_bits)
             log.info("Fused decode kernels installed on %d backbone and %d depth layers", n, m)
 
         config = FastStreamingConfig(
@@ -917,7 +918,14 @@ def main() -> None:
     parser.add_argument(
         "--fused",
         action="store_true",
-        help="Triton-fused decode layers on the backbone (models/fused)",
+        help="Triton-fused decode layers on the backbone and depth decoder (models/fused)",
+    )
+    parser.add_argument(
+        "--fused-attn-bits",
+        type=int,
+        choices=(16, 8),
+        default=16,
+        help="attention projections in the fused path: 16 (as stock) or fp8",
     )
     parser.add_argument(
         "--captioner",
@@ -963,6 +971,7 @@ def main() -> None:
         dtype=args.dtype,
         continuity=args.continuity,
         fused=args.fused,
+        fused_attn_bits=args.fused_attn_bits,
     )
     if args.captioner and (args.captioner / "resampler.pt").is_file():
         describer = VoiceDescriber(engine, args.captioner)
