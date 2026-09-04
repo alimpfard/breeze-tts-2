@@ -48,20 +48,27 @@ def main() -> None:
     args = p.parse_args()
     dev = args.device
     _, model, _ = load_runtime(args.breeze, device=dev, attn_implementation="eager")
-    bb = model.backbone_model
-    dtype = next(bb.parameters()).dtype
+    from models.fp8_linear import quantize_module_fp8
+
     B = 2
-    for variant in ("bf16", "int4-tinygemm"):
-        for li in args.layers:
+    targets = [("backbone", model.backbone_model, args.layers, args.seq, ("bf16", "int4-tinygemm")),
+               ("depth", model.depth_decoder.model, [0, 5, 11], 18, ("bf16", "fp8"))]
+    for name, bb, layer_ids, seq, variants in targets:
+      dtype = next(bb.parameters()).dtype
+      for variant in variants:
+        for li in layer_ids:
             import copy
             layer = copy.deepcopy(bb.layers[li])
             if variant.startswith("int4"):
                 quantize_module_int4(layer)
+            elif variant == "fp8":
+                quantize_module_fp8(layer)
             fused = FusedDecoderLayer(layer, li)
-            c1 = StaticCache(config=bb.config, max_cache_len=args.seq, batch_size=B)
-            c2 = StaticCache(config=bb.config, max_cache_len=args.seq, batch_size=B)
-            ref, last = run_layer(layer, bb, c1, args.steps, B, dev, dtype)
-            out, _ = run_layer(fused, bb, c2, args.steps, B, dev, dtype)
+            c1 = StaticCache(config=bb.config, max_cache_len=seq, batch_size=B)
+            c2 = StaticCache(config=bb.config, max_cache_len=seq, batch_size=B)
+            steps = min(args.steps, seq - 2)
+            ref, last = run_layer(layer, bb, c1, steps, B, dev, dtype)
+            out, _ = run_layer(fused, bb, c2, steps, B, dev, dtype)
             err = (ref - out).abs().max().item() / ref.abs().max().item()
             # the caches must agree too
             k1, k2 = c1.layers[li].keys, c2.layers[li].keys
@@ -69,7 +76,7 @@ def main() -> None:
             x, mask, pos_ids, pos, pe = last
             t_ref = graph_time_us(lambda: layer(x, attention_mask=mask, position_ids=pos_ids, past_key_values=c1, use_cache=True, cache_position=pos, position_embeddings=pe))
             t_fused = graph_time_us(lambda: fused(x, attention_mask=mask, position_ids=pos_ids, past_key_values=c2, use_cache=True, cache_position=pos, position_embeddings=pe))
-            print(f"{variant:<14} layer {li:2d}: rel err out {err:.4f} cache {kerr:.4f} | step {t_ref:6.1f}us -> {t_fused:6.1f}us", flush=True)
+            print(f"{name:<8} {variant:<14} layer {li:2d}: rel err out {err:.4f} cache {kerr:.4f} | step {t_ref:6.1f}us -> {t_fused:6.1f}us", flush=True)
 
 
 if __name__ == "__main__":

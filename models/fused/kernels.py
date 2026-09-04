@@ -71,7 +71,8 @@ def rms_gemv_kernel(
             ss += tl.sum(xk * xk, 1)
         inv = 1.0 / tl.sqrt(ss / K + eps)
 
-    acc = tl.zeros([M_PAD, BLOCK_N], dtype=tl.float32)
+    acc0 = tl.zeros([BLOCK_N], dtype=tl.float32)
+    acc1 = tl.zeros([BLOCK_N], dtype=tl.float32)
     for k0 in range(k_lo, k_lo + k_per, BLOCK_K):
         ks = k0 + tl.arange(0, BLOCK_K)
         xk = tl.load(x_ptr + rows[:, None] * stride_x + ks[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
@@ -92,9 +93,15 @@ def rms_gemv_kernel(
             sc = tl.load(s_ptr + n[:, None] * (K // GROUP_K) + gs[None, :], mask=nmask[:, None], other=0.0).to(tl.float32)
             mn = tl.load(z_ptr + n[:, None] * (K // GROUP_K) + gs[None, :], mask=nmask[:, None], other=0.0).to(tl.float32)
             w = tl.reshape(q * sc[:, :, None] + mn[:, :, None], (BLOCK_N, BLOCK_K))
-        # (M_PAD, 1, BLOCK_K) * (1, BLOCK_N, BLOCK_K) -> reduce K
-        acc += tl.sum(xk[:, None, :] * w[None, :, :], 2)
-    tl.store(part_ptr + (pid_k * M + rows[:, None]) * N + n[None, :], acc, mask=rmask[:, None] & nmask[None, :])
+        # one 2-D reduction per row of x: keeps the tile in a plain layout
+        x0 = tl.sum(tl.where(rows[:, None] == 0, xk, 0.0), 0)
+        acc0 += tl.sum(w * x0[None, :], 1)
+        if M_PAD > 1:
+            x1 = tl.sum(tl.where(rows[:, None] == 1, xk, 0.0), 0)
+            acc1 += tl.sum(w * x1[None, :], 1)
+    tl.store(part_ptr + (pid_k * M + 0) * N + n, acc0, mask=nmask)
+    if M_PAD > 1:
+        tl.store(part_ptr + (pid_k * M + 1) * N + n, acc1, mask=nmask & (M > 1))
 
 
 @triton.jit
@@ -174,11 +181,11 @@ _BEST: dict[tuple, tuple] = {}
 # (BLOCK_N, SPLIT_K, num_warps, num_stages) candidates; a shape is timed once.
 _CANDIDATES = [
     (bn, sk, bk, nw, st)
-    for bn in (4, 8, 16, 32)
-    for sk in (1, 2, 4, 8)
-    for bk in (256, 512, 1024)
-    for nw in (2, 4, 8)
-    for st in (2, 3)
+    for bn in (2, 4, 8, 16)
+    for sk in (1, 2, 4)
+    for bk in (512, 1024, 2048)
+    for nw in (1, 2, 4)
+    for st in (2, 4)
 ]
 
 
@@ -202,7 +209,7 @@ def _launch(cfg, x, fw, norm_weight, eps, epilogue, residual, out, part):
         norm_weight if norm_weight is not None else dummy, part,
         M, N, K, eps, x.stride(0),
         WBITS=fw.bits, NORM=norm_weight is not None,
-        BLOCK_N=bn, SPLIT_K=sk, BLOCK_K=bk, GROUP_K=GROUP, M_PAD=2 if M <= 2 else 4,
+        BLOCK_N=bn, SPLIT_K=sk, BLOCK_K=bk, GROUP_K=GROUP, M_PAD=2,
         num_warps=nw, num_stages=st,
     )
     gemv_epilogue_kernel[(triton.cdiv(n_out, 1024), M)](
@@ -279,9 +286,54 @@ def _tune(key, x, fw, norm_weight, eps, epilogue, residual, out, part) -> tuple:
     return best
 
 
+import json
+import os
+from pathlib import Path
+
+_TUNE_FILE = Path(os.environ.get("BREEZE_FUSED_TUNE", str(Path(__file__).resolve().parents[2] / "configs" / "fused_tune.json")))
+_LOADED: set = set()
+
+
+def _device_tag(device) -> str:
+    return torch.cuda.get_device_name(device).replace(" ", "_")
+
+
+def _tune_key_str(key, device) -> str:
+    N, K, bits, epi, norm, _ = key
+    return f"{_device_tag(device)}|{N}|{K}|{bits}|{epi}|{int(norm)}"
+
+
+def load_tuning(device) -> None:
+    """Tuned configs persist per GPU model: re-timing 200 candidates for a
+    dozen shapes at every server start would be minutes of warmup."""
+    tag = _device_tag(device)
+    if tag in _LOADED or not _TUNE_FILE.exists():
+        _LOADED.add(tag)
+        return
+    try:
+        data = json.loads(_TUNE_FILE.read_text())
+    except Exception:
+        data = {}
+    for k, cfg in data.items():
+        if k.startswith(tag + "|"):
+            _, N, K, bits, epi, norm = k.split("|")
+            _BEST[(int(N), int(K), int(bits), int(epi), bool(int(norm)), str(device))] = tuple(cfg)
+    _LOADED.add(tag)
+
+
+def _save_tuning(key, cfg, device) -> None:
+    try:
+        data = json.loads(_TUNE_FILE.read_text()) if _TUNE_FILE.exists() else {}
+    except Exception:
+        data = {}
+    data[_tune_key_str(key, device)] = list(cfg)
+    _TUNE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _TUNE_FILE.write_text(json.dumps(data, indent=1, sort_keys=True))
+
+
 def rms_gemv(x, fw: FusedWeight, norm_weight=None, eps: float = 1e-6, epilogue: int = 0, residual=None, out=None):
     M, K = x.shape
-    assert K == fw.K and M <= M_PAD
+    assert K == fw.K and M <= 2, "decode GEMV: at most the two CFG rows"
     N = fw.N
     n_out = N // 2 if epilogue == 1 else N
     if out is None:
@@ -290,7 +342,11 @@ def rms_gemv(x, fw: FusedWeight, norm_weight=None, eps: float = 1e-6, epilogue: 
     key = (N, K, fw.bits, epilogue, norm_weight is not None, str(x.device))
     cfg = _BEST.get(key)
     if cfg is None:
+        load_tuning(x.device)
+        cfg = _BEST.get(key)
+    if cfg is None:
         cfg = _tune(key, x, fw, norm_weight, eps, epilogue, residual, out, part)
+        _save_tuning(key, cfg, x.device)
     _launch(cfg, x, fw, norm_weight, eps, epilogue, residual, out, part)
     return out
 
