@@ -154,6 +154,7 @@ class VoiceScorer:
 
         # Depth decoder: logits[:, k-1] predicts codebook k, frames in order.
         depth_logits = out.depth_decoder_logits.float()  # (frames, K-1, V)
+        self._last_depth_logits = depth_logits  # mtp.collect reads these
         assert depth_logits.shape[0] == frames, (depth_logits.shape, frames)
         depth_targets = input_values[0, :, 1:]
         nll_depth = F.cross_entropy(
