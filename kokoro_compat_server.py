@@ -159,6 +159,20 @@ EOS_STOP_RATIO = 8.0
 # trailing silence is trimmed back to this when a lookahead was used.
 TRAILING_SILENCE_MAX = 0.3
 TRAILING_SILENCE_DB = -40.0
+# The negative row starts to prefer EOS the moment the sentence's last word
+# is done, a frame or more before the stop rule fires; the frames between
+# hold the model's pause and, when the pause is short, the first sounds of
+# the lookahead. Audio and conditioning codes are cut at that onset, and the
+# pause is rebuilt from the silence rules below.
+EOS_ONSET_PROB = 0.002
+TRAILING_SILENCE_MIN = 0.15
+# Output level: each sentence is matched to the voice's reference clip
+# (speech-active rms), within these gain bounds. Generation drifts quieter
+# as a conditioning chain grows; the listener should not hear that.
+LEVEL_MATCH_MIN_GAIN_DB = -6.0
+LEVEL_MATCH_MAX_GAIN_DB = 12.0
+LEVEL_ACTIVE_DB = -40.0
+DESIGN_TARGET_RMS_DB = -23.0
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("breeze-tts")
@@ -194,7 +208,33 @@ def prepare_text(text: str) -> str:
     "three"). Then symbol/decimal normalisation, since the model drops currency
     symbols entirely and mis-reads decimal points.
     """
-    return normalize_text(strip_emoticons(text))
+    return normalize_text(speakable_markup(strip_emoticons(text)))
+
+
+_BRACKET_RE = re.compile(r"\s*[\[{(]\s*([^\[\]{}()]*?)\s*[\]})]\s*")
+_ARROW_RE = re.compile(r"\s*(?:->|=>|>|→|➜|⇒)\s*")
+# Only inside brackets: "Is it??" at the end of a sentence is emphasis.
+_QMARKS_RE = re.compile(r"\?{2,}(?=\s*[\]})])")
+
+
+def speakable_markup(text: str) -> str:
+    """Game-log style markup the model reads as noise.
+
+    ``[Level 277 > Level 278]`` (clients send brackets as braces) came out as
+    "level two one seven eight" or worse: the braces and the arrow are what
+    confuse it, the digits themselves it reads fine. So brackets become a
+    parenthetical set off by commas, arrows become "to", and a run of
+    question marks standing in for a value becomes "unknown".
+    """
+    text = _QMARKS_RE.sub(" unknown", text)
+    text = _ARROW_RE.sub(" to ", text)
+    text = _BRACKET_RE.sub(lambda m: f", {m.group(1)}, " if m.group(1).strip() else " ", text)
+    text = re.sub(r"\s*,(\s*,)+", ",", text)
+    text = re.sub(r"^\s*,\s*", "", text)
+    text = re.sub(r"\s*,\s*([.!?])", r"\1", text)
+    text = re.sub(r"([.!?])\s*,\s*", r"\1 ", text)
+    text = re.sub(r",\s*$", ".", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
 
 
 def is_runaway(text: str, seconds: float) -> bool:
@@ -230,10 +270,53 @@ def trim_trailing_silence(audio: np.ndarray, sample_rate: int) -> np.ndarray:
     loud = np.nonzero(20 * np.log10(rms + 1e-9) > TRAILING_SILENCE_DB)[0]
     if len(loud) == 0:
         return audio
-    keep = min(
-        len(audio), (int(loud[-1]) + 1) * win + int(sample_rate * TRAILING_SILENCE_MAX)
-    )
-    return audio[:keep]
+    # A short burst at the very end after a clear gap is the lookahead's
+    # first sound, not part of the sentence: drop it and re-measure.
+    if len(loud) >= 2:
+        gap = int(loud[-1]) - int(loud[-2])
+        burst = 1
+        j = len(loud) - 1
+        while j >= 1 and int(loud[j]) - int(loud[j - 1]) == 1:
+            j -= 1
+            burst += 1
+        gap = int(loud[j]) - int(loud[j - 1]) if j >= 1 else 0
+        if burst * win <= sample_rate * 0.12 and gap * win >= sample_rate * 0.10:
+            loud = loud[:j]
+    end = (int(loud[-1]) + 1) * win
+    keep = min(len(audio), end + int(sample_rate * TRAILING_SILENCE_MAX))
+    audio = audio[:keep]
+    want = end + int(sample_rate * TRAILING_SILENCE_MIN)
+    if len(audio) < want:
+        audio = np.concatenate([audio, np.zeros(want - len(audio), dtype=audio.dtype)])
+    return audio
+
+
+def active_rms(audio: np.ndarray, sample_rate: int) -> float:
+    """RMS over the 20 ms windows that carry speech, so pauses do not count."""
+    win = max(1, int(sample_rate * 0.02))
+    frames = len(audio) // win
+    if frames < 1:
+        return float(np.sqrt((audio**2).mean() + 1e-12))
+    rms = np.sqrt((audio[: frames * win].reshape(frames, win) ** 2).mean(axis=1) + 1e-12)
+    loud = rms[20 * np.log10(rms) > LEVEL_ACTIVE_DB]
+    return float(np.sqrt((loud**2).mean())) if len(loud) else float(rms.mean())
+
+
+def level_match(audio: np.ndarray, sample_rate: int, target_rms: float) -> tuple[np.ndarray, float]:
+    """Scale to the target speech-active rms within the gain bounds; returns
+    (audio, gain_db). Peaks are kept under -0.5 dBFS."""
+    if not audio.size or target_rms <= 0:
+        return audio, 0.0
+    current = active_rms(audio, sample_rate)
+    if current <= 0:
+        return audio, 0.0
+    gain_db = float(np.clip(20 * np.log10(target_rms / current), LEVEL_MATCH_MIN_GAIN_DB, LEVEL_MATCH_MAX_GAIN_DB))
+    gain = 10 ** (gain_db / 20)
+    peak = float(np.abs(audio).max()) * gain
+    if peak > 0.94:
+        gain *= 0.94 / peak
+        gain_db = 20 * np.log10(gain)
+    return (audio * gain).astype(np.float32, copy=False), gain_db
 
 
 def lookahead_of(next_text: str, words: int = LOOKAHEAD_WORDS) -> str:
@@ -270,11 +353,10 @@ class Voice:
 
     @property
     def reference_rms(self) -> float:
-        """RMS of the canonical clip, used as the level-matching target."""
+        """Speech-active RMS of the canonical clip: the level-matching target."""
         if self._reference_rms is None:
-            audio, _ = sf.read(self.wav, always_2d=True, dtype="float32")
-            mono = audio.mean(axis=1)
-            self._reference_rms = float(np.sqrt((mono**2).mean()))
+            audio, sr = sf.read(self.wav, always_2d=True, dtype="float32")
+            self._reference_rms = active_rms(audio.mean(axis=1), sr)
         return self._reference_rms
 
 
@@ -579,6 +661,20 @@ class BreezeEngine:
             if streamed.codes is not None and len(streamed.codes):
                 code_blocks.append(streamed.codes)
 
+        onset_frames = None
+        if stop_when is not None and curve:
+            # Walk back from the stop through the run of frames where the
+            # negative row already leaned to EOS: that run starts where the
+            # sentence ended. Keep one frame past it for the word's release.
+            by_frame = {f: u for f, u, _ in curve}
+            last = max(by_frame)
+            if by_frame[last] >= EOS_STOP_PROB:
+                onset = last
+                while onset - 1 in by_frame and by_frame[onset - 1] >= EOS_ONSET_PROB:
+                    onset -= 1
+                # The stop frame itself is where the conditioned row has
+                # already begun the lookahead word; never keep it.
+                onset_frames = max(1, min(last - 1, onset + 1))
         if stop_when is not None:
             top = sorted(curve, key=lambda c: -c[1])[:6]
             log.info(
@@ -592,6 +688,11 @@ class BreezeEngine:
             return np.zeros(0, dtype=np.float32), None
         audio = np.concatenate(pieces).astype(np.float32, copy=False)
         codes = np.concatenate(code_blocks, axis=0) if code_blocks else None
+        if onset_frames is not None and codes is not None and 0 < onset_frames < len(codes):
+            samples = int(round(onset_frames * self.sample_rate / FRAME_RATE))
+            log.info("lookahead cut: %d of %d frames kept", onset_frames, len(codes))
+            audio = audio[:samples]
+            codes = codes[:onset_frames]
         return audio, codes
 
     def synthesize(self, text: str, voice: Voice) -> np.ndarray:
@@ -665,17 +766,21 @@ async def tts_to_audio(req: TTSRequest) -> Response:
     if not audio.size:
         return Response(status_code=400, content="No audio generated")
 
+    target = voice.reference_rms if voice is not None else 10 ** (DESIGN_TARGET_RMS_DB / 20)
+    audio, gain_db = level_match(audio, engine.sample_rate, target)
+
     buf = io.BytesIO()
     sf.write(buf, audio, engine.sample_rate, format="WAV", subtype="PCM_16")
 
     elapsed = time.time() - started
     duration = len(audio) / engine.sample_rate
     log.info(
-        "Generated %.1fs audio in %.2fs (%.2fx realtime) voice=%s mood=%r "
+        "Generated %.1fs audio in %.2fs (%.2fx realtime) gain=%+.1fdB voice=%s mood=%r "
         "cond_in=%.1fs cond_out=%.1fs text=%.50s",
         duration,
         elapsed,
         duration / elapsed if elapsed > 0 else 0.0,
+        gain_db,
         voice.name if voice is not None else f"design:{design[:40]!r}",
         req.mood or "",
         total_seconds(incoming),
